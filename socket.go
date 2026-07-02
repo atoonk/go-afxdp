@@ -110,6 +110,16 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 			return nil, fmt.Errorf("afxdp: %s must be a power of two, got %d", name, v)
 		}
 	}
+	// The fill ring can only ever hold as many buffers as the receive pool
+	// (NumFrames - TxFrames) has to give it. A fill ring larger than the rx pool
+	// is silently capped to the pool size, which reads as "I asked for a deep
+	// ring but throughput is still low" — a perf cliff that's easy to hit and
+	// hard to see. Reject it so the misconfiguration is loud, not silent.
+	if rxPool := opts.NumFrames - opts.TxFrames; opts.FillRingNumDescs > rxPool {
+		return nil, fmt.Errorf("afxdp: FillRingNumDescs (%d) exceeds the rx frame pool (%d = NumFrames-TxFrames); "+
+			"raise NumFrames or lower TxFrames (e.g. WithReceiveHeavy) so the fill ring can be backed",
+			opts.FillRingNumDescs, rxPool)
+	}
 
 	xsk := &Socket{fd: -1, ifindex: ifindex, options: opts}
 

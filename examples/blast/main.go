@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -42,6 +43,7 @@ func main() {
 	dstMACs := flag.String("dst-mac", "", "destination MAC (default: resolve via ARP)")
 	srcIPs := flag.String("src-ip", "", "source IP (default: the interface's first IPv4)")
 	size := flag.Int("size", 64, "total frame size in bytes (>=42)")
+	vlan := flag.Int("vlan", 0, "802.1Q VLAN ID to tag frames with (0 = untagged)")
 	queues := flag.Int("queues", 0, "tx queues to use (0 = all)")
 	duration := flag.Duration("duration", 10*time.Second, "how long to blast (0 = until Ctrl-C)")
 	flag.Parse()
@@ -61,8 +63,12 @@ func main() {
 	srcMAC := link.Attrs().HardwareAddr
 	srcIP := pickSrcIP(link, *srcIPs)
 	dstMAC := pickDstMAC(link, dip, *dstMACs)
-	log.Printf("blasting %s:%d  (%s %s -> %s %s, %d-byte frames)",
-		*dstIP, *dstPort, srcIP, srcMAC, dstMAC, dip, *size)
+	vlanNote := ""
+	if *vlan > 0 {
+		vlanNote = " " + "vlan " + strconv.Itoa(*vlan)
+	}
+	log.Printf("blasting %s:%d  (%s %s -> %s %s, %d-byte frames%s)",
+		*dstIP, *dstPort, srcIP, srcMAC, dstMAC, dip, *size, vlanNote)
 
 	// Attach a no-op program (MatchNone) so we get the zero-copy TX datapath
 	// without stealing any receive traffic, and bind one socket per queue.
@@ -86,7 +92,7 @@ func main() {
 		log.Printf("warning: %s not up after 15s; transmitting anyway", *iface)
 	}
 
-	template := buildFrame(srcMAC, dstMAC, srcIP, dip, uint16(*dstPort), *size)
+	template, srcPortOff := buildFrame(srcMAC, dstMAC, srcIP, dip, uint16(*dstPort), *size, *vlan)
 
 	// stop tells every goroutine to wind down; wg lets us wait for them so the
 	// link (and the host's connectivity) is released cleanly before we detach.
@@ -97,7 +103,7 @@ func main() {
 		wg.Add(1)
 		go func(i int, xsk *afxdp.Socket) {
 			defer wg.Done()
-			blast(xsk, template, uint16(1024+i*64), &bytes, &stop)
+			blast(xsk, template, srcPortOff, uint16(1024+i*64), &bytes, &stop)
 		}(i, xsk)
 	}
 	wg.Add(1)
@@ -124,7 +130,7 @@ func main() {
 // completions, allocate as many frames as there is ring space, stamp each with
 // an incrementing source port, and transmit. One goroutine owns this socket's
 // transmit side, so no locking is needed.
-func blast(xsk *afxdp.Socket, template []byte, startPort uint16, bytes *atomic.Uint64, stop *atomic.Bool) {
+func blast(xsk *afxdp.Socket, template []byte, srcPortOff int, startPort uint16, bytes *atomic.Uint64, stop *atomic.Bool) {
 	const batch = 256
 	port := startPort
 	for !stop.Load() {
@@ -134,7 +140,7 @@ func blast(xsk *afxdp.Socket, template []byte, startPort uint16, bytes *atomic.U
 		// receiver's RSS.
 		n := xsk.SendFunc(batch, func(i int, frame []byte) int {
 			copy(frame, template)
-			binary.BigEndian.PutUint16(frame[34:], port) // vary UDP source port
+			binary.BigEndian.PutUint16(frame[srcPortOff:], port) // vary UDP source port
 			port++
 			return len(template)
 		})
@@ -163,31 +169,48 @@ func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, stop *atomic.Bool) {
 	}
 }
 
-// buildFrame builds the Ethernet+IPv4+UDP template. The UDP checksum is left 0
-// (legal for IPv4), so varying the source port per packet needs no recompute;
-// the IPv4 header checksum doesn't cover the ports, so it stays valid too.
-func buildFrame(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, dstPort uint16, size int) []byte {
-	if size < 42 {
-		size = 42
+// buildFrame builds the Ethernet+IPv4+UDP template and returns it along with
+// the byte offset of the UDP source port (which the TX loop stamps per packet).
+// A non-zero vlan inserts an 802.1Q tag after the source MAC, shifting every
+// header past it by 4 bytes — hence returning the source-port offset instead of
+// hardcoding it. The UDP checksum is left 0 (legal for IPv4), so varying the
+// source port per packet needs no recompute; the IPv4 header checksum doesn't
+// cover the ports, so it stays valid too.
+func buildFrame(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, dstPort uint16, size, vlan int) ([]byte, int) {
+	ethLen := 14 // dst + src MAC + ethertype
+	if vlan > 0 {
+		ethLen += 4 // 802.1Q tag
+	}
+	if minSize := ethLen + 28; size < minSize { // 20 IPv4 + 8 UDP
+		size = minSize
 	}
 	f := make([]byte, size)
 	copy(f[0:6], dstMAC)
 	copy(f[6:12], srcMAC)
-	binary.BigEndian.PutUint16(f[12:], 0x0800) // IPv4
 
-	f[14] = 0x45                                        // IPv4, IHL 5
-	f[22] = 64                                          // TTL
-	f[23] = 17                                          // UDP
-	binary.BigEndian.PutUint16(f[16:], uint16(size-14)) // IP total length
-	copy(f[26:30], srcIP.To4())
-	copy(f[30:34], dstIP.To4())
-	binary.BigEndian.PutUint16(f[24:], ipChecksum(f[14:34]))
+	et := 12 // offset of the (inner) ethertype
+	if vlan > 0 {
+		binary.BigEndian.PutUint16(f[12:], 0x8100)              // 802.1Q TPID
+		binary.BigEndian.PutUint16(f[14:], uint16(vlan)&0x0fff) // PCP 0, DEI 0, VID
+		et = 16
+	}
+	binary.BigEndian.PutUint16(f[et:], 0x0800) // IPv4
 
-	binary.BigEndian.PutUint16(f[34:], 1024)            // UDP src port (varied at TX)
-	binary.BigEndian.PutUint16(f[36:], dstPort)         // UDP dst port
-	binary.BigEndian.PutUint16(f[38:], uint16(size-34)) // UDP length
-	// UDP checksum (f[40:42]) left zero.
-	return f
+	ip := et + 2                                          // IPv4 header start
+	f[ip] = 0x45                                          // IPv4, IHL 5
+	f[ip+8] = 64                                          // TTL
+	f[ip+9] = 17                                          // UDP
+	binary.BigEndian.PutUint16(f[ip+2:], uint16(size-ip)) // IP total length
+	copy(f[ip+12:ip+16], srcIP.To4())
+	copy(f[ip+16:ip+20], dstIP.To4())
+	binary.BigEndian.PutUint16(f[ip+10:], ipChecksum(f[ip:ip+20]))
+
+	udp := ip + 20                                          // UDP header start
+	binary.BigEndian.PutUint16(f[udp:], 1024)               // UDP src port (varied at TX)
+	binary.BigEndian.PutUint16(f[udp+2:], dstPort)          // UDP dst port
+	binary.BigEndian.PutUint16(f[udp+4:], uint16(size-udp)) // UDP length
+	// UDP checksum (f[udp+6:udp+8]) left zero.
+	return f, udp
 }
 
 // waitLinkUp polls until the interface is operationally up, or the timeout

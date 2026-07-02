@@ -35,9 +35,12 @@ func main() {
 
 	// Filter to the one UDP port so only the flood reaches userspace; the rest
 	// of the host's traffic stays with the kernel. Mode is auto-selected.
+	// WithReceiveHeavy because this is a pure sink: it never transmits, so give
+	// the whole UMEM to the receive pool instead of reserving half for tx.
 	fleet, err := afxdp.Open(*iface,
 		afxdp.WithUDPPorts(uint16(*port)),
 		afxdp.WithQueues(*queues),
+		afxdp.WithReceiveHeavy(),
 	)
 	if err != nil {
 		log.Fatalf("open: %v", err)

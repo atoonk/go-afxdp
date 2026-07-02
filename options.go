@@ -61,16 +61,23 @@ type Options struct {
 }
 
 // DefaultOptions returns Options with sane defaults for a balanced rx/tx
-// workload: 4096 frames of 2048 bytes, split evenly, with 2048-entry rings.
+// workload: 8192 frames of 2048 bytes, split evenly, with 4096-entry rings.
+//
+// The ring depth matters for line-rate receive: a shallow rx/fill ring
+// overflows between drains (visible as XDP_STATISTICS rx_ring_full) and caps
+// throughput well below what the NIC can deliver. 4096-entry rings backed by a
+// large enough frame pool keep the driver fed at 10G+ small-packet rates; the
+// ring memory this costs is negligible next to the UMEM. A pure receiver can
+// hand almost all frames to the rx pool with WithReceiveHeavy.
 func DefaultOptions() Options {
 	return Options{
-		NumFrames:              4096,
+		NumFrames:              8192,
 		FrameSize:              2048,
-		TxFrames:               2048,
-		FillRingNumDescs:       2048,
-		CompletionRingNumDescs: 2048,
-		RxRingNumDescs:         2048,
-		TxRingNumDescs:         2048,
+		TxFrames:               4096,
+		FillRingNumDescs:       4096,
+		CompletionRingNumDescs: 4096,
+		RxRingNumDescs:         4096,
+		TxRingNumDescs:         4096,
 		BindFlags:              0,
 		XDPFlags:               0,
 	}
@@ -198,8 +205,18 @@ func WithFrameSize(n int) Option { return func(c *config) { c.opts.FrameSize = n
 // Default half. Lower it for receive-heavy workloads, raise it for senders.
 func WithTxFrames(n int) Option { return func(c *config) { c.opts.TxFrames = n } }
 
+// WithReceiveHeavy is an optional optimization for receive-only sockets (sinks,
+// sniffers, taps that never transmit). The default splits the UMEM evenly
+// between rx and tx pools; a pure receiver never uses the tx half, so this
+// reserves just 64 tx frames and hands the rest to rx. That is not required to
+// reach line rate — the default rings already do — but it gives the fill ring
+// generous slack (the rx pool ends up far larger than the fill ring) so the
+// driver never starves under bursts, and reclaims the otherwise-idle tx memory.
+// Don't use it on a socket that also transmits.
+func WithReceiveHeavy() Option { return func(c *config) { c.opts.TxFrames = 64 } }
+
 // WithRingSize sets all four ring sizes (fill, completion, rx, tx) at once.
-// Must be a power of two. Default 2048. Use WithOptions for per-ring control.
+// Must be a power of two. Default 4096. Use WithOptions for per-ring control.
 func WithRingSize(n int) Option {
 	return func(c *config) {
 		c.opts.FillRingNumDescs = n
