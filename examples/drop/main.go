@@ -11,15 +11,20 @@
 //	# small packets stress pps; large packets stress bandwidth
 //	sudo pktgen / udpblast / iperf3 -u -c <host> -p 9999 -b 0 -l 64
 //
-// It prints receive pps and bit/s once a second, plus the kernel's drop
-// counters so you can see when you've saturated the rings.
+// It prints receive pps and bit/s once a second, plus drop counters split into
+// nic-side (the NIC ran out of rx descriptors) and app-side (this program didn't
+// drain its rx ring fast enough, broken out per queue) so you can see whether
+// you're losing packets and which stage is the bottleneck.
 package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -56,7 +61,7 @@ func main() {
 		go drop(xsk, &bytes)
 	}
 
-	go report(fleet, &bytes)
+	go report(fleet, &bytes, *iface)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -91,21 +96,80 @@ func drop(xsk *afxdp.Socket, bytes *atomic.Uint64) {
 // which is why raw frame bytes badly understate line-rate use at high pps.
 const ethWireOverhead = 24
 
-// report prints the receive rate once a second.
-func report(fleet *afxdp.Fleet, bytes *atomic.Uint64) {
+// report prints, once a second, the receive rate and two kinds of drops so you
+// can see whether packets are being lost and where:
+//
+//   - nic:  packets that arrived on the wire but the NIC had no free rx
+//     descriptor to put them in (netdev rx_missed_errors). Non-zero means the
+//     receive pipeline as a whole is falling behind the wire.
+//   - app:  packets the NIC handed us but WE dropped because our rx ring was
+//     full — this program didn't drain fast enough. The per-queue breakdown
+//     ([ring-full/q: ...]) shows exactly which rx queue/core is the bottleneck.
+//
+// Both are drops at or after this NIC. Packets lost in the network/switch before
+// they reach here are invisible to any receiver — to see those, compare the
+// sender's tx rate to this rx rate.
+func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, iface string) {
+	socks := fleet.Sockets()
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	var lastP, lastB uint64
+	var lastP, lastB, lastRingFull uint64
+	// rx_missed comes from the netdev stats, which ixgbe (and similar drivers)
+	// refresh only every ~2s — so a 1-second delta sawtooths between 0 and two
+	// seconds' worth. Keep two ticks of history and report the delta over that
+	// 2s window (halved) so the nic drop rate reads steady instead of 0/N/0/N.
+	missedHist := [2]uint64{readMissed(iface), readMissed(iface)}
+	perQLast := make([]uint64, len(socks))
 	for range t.C {
-		s, err := fleet.Stats()
-		if err != nil {
-			continue
+		// One pass over the sockets: total rx, total rx-ring-full drops, and the
+		// per-queue rx-ring-full so we can point at the hot queue.
+		var rxPkts, ringFull uint64
+		perQ := make([]uint64, len(socks))
+		for i, xsk := range socks {
+			st, err := xsk.Stats()
+			if err != nil {
+				continue
+			}
+			rxPkts += st.Received
+			ringFull += st.KernelStats.Rx_ring_full
+			perQ[i] = st.KernelStats.Rx_ring_full
 		}
+
 		b := bytes.Load()
-		pps := s.RxPackets - lastP
+		pps := rxPkts - lastP
 		gbits := float64((b-lastB)+pps*ethWireOverhead) * 8 / 1e9 // wire rate
-		log.Printf("%d pps  %.2f Gbit/s  (rx_ring_full=%d fill_empty=%d)",
-			pps, gbits, s.RxRingFull, s.RxFillRingEmpty)
-		lastP, lastB = s.RxPackets, b
+
+		var hot strings.Builder
+		for i := range socks {
+			if d := perQ[i] - perQLast[i]; d > 0 {
+				fmt.Fprintf(&hot, " q%d=%d", i, d)
+			}
+			perQLast[i] = perQ[i]
+		}
+		perQueue := ""
+		if hot.Len() > 0 {
+			perQueue = "   [ring-full/q:" + hot.String() + " ]"
+		}
+
+		missed := readMissed(iface)
+		nicDrops := (missed - missedHist[0]) / 2 // delta over the last ~2s, per second
+		missedHist[0], missedHist[1] = missedHist[1], missed
+
+		log.Printf("%d rx pps  %.2f Gbit/s   drops: nic=%d/s app=%d/s%s",
+			pps, gbits, nicDrops, ringFull-lastRingFull, perQueue)
+
+		lastP, lastB, lastRingFull = rxPkts, b, ringFull
 	}
+}
+
+// readMissed returns the interface's cumulative rx_missed_errors — packets the
+// NIC received off the wire but had no rx descriptor for. Returns 0 if the
+// counter can't be read (e.g. a device without it).
+func readMissed(iface string) uint64 {
+	data, err := os.ReadFile("/sys/class/net/" + iface + "/statistics/rx_missed_errors")
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	return v
 }

@@ -28,9 +28,11 @@ import (
 //		afxdp.MatchICMPEcho(),           // ...and ICMP echo requests
 //	))
 //
-// Matches operate on plain Ethernet + IPv4 (no VLAN tag, no IP options), which
-// covers the common case. For arbitrary classification beyond these builders,
-// redirect everything (no filter) and classify in your receive loop.
+// Matches operate on Ethernet + IPv4/IPv6 (no IP options). A single 802.1Q VLAN
+// tag is skipped transparently, so the same match works whether or not the NIC
+// strips the tag before XDP (QinQ / stacked tags are not unwound). For arbitrary
+// classification beyond these builders, redirect everything (no filter) and
+// classify in your receive loop.
 type Match struct {
 	// build emits the eBPF for this rule. On a match it jumps to redirectSym;
 	// otherwise it falls through to the physically next block (nextSym, used
@@ -78,6 +80,7 @@ const (
 
 	etherTypeIPv4LE = 0x0008 // htons(0x0800) as seen by a little-endian load
 	etherTypeIPv6LE = 0xdd86 // htons(0x86dd)
+	etherTypeVLANLE = 0x0081 // htons(0x8100), the 802.1Q tag TPID; l3Base skips it
 	ipProtoICMP     = 1
 	ipProtoTCP      = 6
 	ipProtoUDP      = 17
@@ -96,31 +99,55 @@ func withEntry(entry string, ins asm.Instructions) asm.Instructions {
 	return ins
 }
 
-// boundsCheck emits "if data + n > data_end goto next".
-func boundsCheck(n int32, next string) asm.Instructions {
+// boundsFrom emits "if base + n > data_end goto next", bounds-checking a read of
+// the first n bytes starting at base. base is R7 (frame start) for the ethertype
+// probe, or R9 (the VLAN-adjusted L3 base set by l3Base) for the L3/L4 fields.
+func boundsFrom(base asm.Register, n int32, next string) asm.Instructions {
 	return asm.Instructions{
-		asm.Mov.Reg(asm.R2, asm.R7),
+		asm.Mov.Reg(asm.R2, base),
 		asm.Add.Imm(asm.R2, n),
 		asm.JGT.Reg(asm.R2, asm.R6, next),
 	}
+}
+
+// l3Base sets R9 to the start of the Ethernet frame, transparently stepping over
+// a single 802.1Q VLAN tag if one is present. Downstream matchers load their
+// fixed field offsets (ethertype +12, IP proto +23, ports +36, addresses
+// +26/+30, ...) relative to R9, so they resolve correctly whether the frame
+// reaches XDP tagged or already stripped by the NIC. It bounds-checks the
+// ethertype read and jumps to next on a runt frame. label must be unique per
+// block (callers pass their entry symbol). Only the outermost single C-VLAN is
+// unwound; QinQ / stacked tags are not. R9 is scratch here — the redirect tail
+// uses R8 (rx_queue_index), not R9.
+func l3Base(label, next string) asm.Instructions {
+	notag := label + "_notag"
+	ins := asm.Instructions{asm.Mov.Reg(asm.R9, asm.R7)} // R9 = data
+	ins = append(ins, boundsFrom(asm.R9, offEtherType+2, next)...)
+	return append(ins,
+		asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
+		asm.JNE.Imm(asm.R3, etherTypeVLANLE, notag),
+		asm.Add.Imm(asm.R9, 4),                       // step over the 4-byte tag
+		asm.Mov.Reg(asm.R9, asm.R9).WithSymbol(notag), // no-op landing pad for the label
+	)
 }
 
 // MatchUDPPort matches IPv4/UDP packets whose destination port is one of ports.
 // With no ports it matches all IPv4/UDP traffic.
 func MatchUDPPort(ports ...uint16) Match {
 	return Match{desc: portsDesc("udp", ports), build: func(entry, next, redirect string) asm.Instructions {
-		ins := boundsCheck(offL4Dport+2, next)
+		ins := l3Base(entry, next)
+		ins = append(ins, boundsFrom(asm.R9, offL4Dport+2, next)...)
 		ins = append(ins,
-			asm.LoadMem(asm.R3, asm.R7, offEtherType, asm.Half),
+			asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 			asm.JNE.Imm(asm.R3, etherTypeIPv4LE, next),
-			asm.LoadMem(asm.R3, asm.R7, offIPProto, asm.Byte),
+			asm.LoadMem(asm.R3, asm.R9, offIPProto, asm.Byte),
 			asm.JNE.Imm(asm.R3, ipProtoUDP, next),
 		)
 		if len(ports) == 0 {
 			ins = append(ins, asm.Ja.Label(redirect))
 			return withEntry(entry, ins)
 		}
-		ins = append(ins, asm.LoadMem(asm.R3, asm.R7, offL4Dport, asm.Half))
+		ins = append(ins, asm.LoadMem(asm.R3, asm.R9, offL4Dport, asm.Half))
 		for _, p := range ports {
 			ins = append(ins, asm.JEq.Imm(asm.R3, netshort(p), redirect))
 		}
@@ -133,18 +160,19 @@ func MatchUDPPort(ports ...uint16) Match {
 // With no ports it matches all IPv4/TCP traffic.
 func MatchTCPPort(ports ...uint16) Match {
 	return Match{desc: portsDesc("tcp", ports), build: func(entry, next, redirect string) asm.Instructions {
-		ins := boundsCheck(offL4Dport+2, next)
+		ins := l3Base(entry, next)
+		ins = append(ins, boundsFrom(asm.R9, offL4Dport+2, next)...)
 		ins = append(ins,
-			asm.LoadMem(asm.R3, asm.R7, offEtherType, asm.Half),
+			asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 			asm.JNE.Imm(asm.R3, etherTypeIPv4LE, next),
-			asm.LoadMem(asm.R3, asm.R7, offIPProto, asm.Byte),
+			asm.LoadMem(asm.R3, asm.R9, offIPProto, asm.Byte),
 			asm.JNE.Imm(asm.R3, ipProtoTCP, next),
 		)
 		if len(ports) == 0 {
 			ins = append(ins, asm.Ja.Label(redirect))
 			return withEntry(entry, ins)
 		}
-		ins = append(ins, asm.LoadMem(asm.R3, asm.R7, offL4Dport, asm.Half))
+		ins = append(ins, asm.LoadMem(asm.R3, asm.R9, offL4Dport, asm.Half))
 		for _, p := range ports {
 			ins = append(ins, asm.JEq.Imm(asm.R3, netshort(p), redirect))
 		}
@@ -155,13 +183,14 @@ func MatchTCPPort(ports ...uint16) Match {
 // MatchICMPEcho matches IPv4 ICMP echo-request (ping) packets.
 func MatchICMPEcho() Match {
 	return Match{desc: "icmp-echo", build: func(entry, next, redirect string) asm.Instructions {
-		ins := boundsCheck(offICMPType+1, next)
+		ins := l3Base(entry, next)
+		ins = append(ins, boundsFrom(asm.R9, offICMPType+1, next)...)
 		ins = append(ins,
-			asm.LoadMem(asm.R3, asm.R7, offEtherType, asm.Half),
+			asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 			asm.JNE.Imm(asm.R3, etherTypeIPv4LE, next),
-			asm.LoadMem(asm.R3, asm.R7, offIPProto, asm.Byte),
+			asm.LoadMem(asm.R3, asm.R9, offIPProto, asm.Byte),
 			asm.JNE.Imm(asm.R3, ipProtoICMP, next),
-			asm.LoadMem(asm.R3, asm.R7, offICMPType, asm.Byte),
+			asm.LoadMem(asm.R3, asm.R9, offICMPType, asm.Byte),
 			asm.JNE.Imm(asm.R3, icmpEchoRequest, next),
 			asm.Ja.Label(redirect),
 		)
@@ -174,11 +203,12 @@ func MatchICMPEcho() Match {
 // protocols with port filtering.
 func MatchIPProto(proto uint8) Match {
 	return Match{desc: fmt.Sprintf("ip-proto/%d", proto), build: func(entry, next, redirect string) asm.Instructions {
-		ins := boundsCheck(offIPProto+1, next)
+		ins := l3Base(entry, next)
+		ins = append(ins, boundsFrom(asm.R9, offIPProto+1, next)...)
 		ins = append(ins,
-			asm.LoadMem(asm.R3, asm.R7, offEtherType, asm.Half),
+			asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 			asm.JNE.Imm(asm.R3, etherTypeIPv4LE, next),
-			asm.LoadMem(asm.R3, asm.R7, offIPProto, asm.Byte),
+			asm.LoadMem(asm.R3, asm.R9, offIPProto, asm.Byte),
 			asm.JNE.Imm(asm.R3, int32(proto), next),
 			asm.Ja.Label(redirect),
 		)
@@ -188,12 +218,15 @@ func MatchIPProto(proto uint8) Match {
 
 // MatchEtherType matches packets with the given EtherType (e.g. 0x0806 for ARP,
 // 0x86DD for IPv6). Pass the value in host order; MatchEtherType handles the
-// byte order.
+// byte order. A single 802.1Q tag is skipped first, so this matches the inner
+// (encapsulated) EtherType — MatchEtherType(0x0806) catches ARP whether or not
+// the frame is tagged.
 func MatchEtherType(etherType uint16) Match {
 	return Match{desc: fmt.Sprintf("ethertype/0x%04x", etherType), build: func(entry, next, redirect string) asm.Instructions {
-		ins := boundsCheck(offEtherType+2, next)
+		ins := l3Base(entry, next)
+		ins = append(ins, boundsFrom(asm.R9, offEtherType+2, next)...)
 		ins = append(ins,
-			asm.LoadMem(asm.R3, asm.R7, offEtherType, asm.Half),
+			asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 			asm.JNE.Imm(asm.R3, netshort(etherType), next),
 			asm.Ja.Label(redirect),
 		)
@@ -236,9 +269,10 @@ func MatchFlow(srcCIDR, dstCIDR string) Match {
 		desc: "src " + src.String() + " & dst " + dst.String(),
 		build: func(entry, next, redirect string) asm.Instructions {
 			srcOff, dstOff, et, end := ipOffsets(src.Addr().Is4())
-			ins := boundsCheck(int32(end), next)
+			ins := l3Base(entry, next)
+			ins = append(ins, boundsFrom(asm.R9, int32(end), next)...)
 			ins = append(ins,
-				asm.LoadMem(asm.R3, asm.R7, offEtherType, asm.Half),
+				asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 				asm.JNE.Imm(asm.R3, int32(et), next),
 			)
 			ins = append(ins, cidrTest(srcOff, src, next)...) // src not in CIDR -> next
@@ -267,9 +301,10 @@ func matchIP(cidr string, isSrc bool) Match {
 			if isSrc {
 				off = srcOff
 			}
-			ins := boundsCheck(int32(end), next)
+			ins := l3Base(entry, next)
+			ins = append(ins, boundsFrom(asm.R9, int32(end), next)...)
 			ins = append(ins,
-				asm.LoadMem(asm.R3, asm.R7, offEtherType, asm.Half),
+				asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 				asm.JNE.Imm(asm.R3, int32(et), next),
 			)
 			ins = append(ins, cidrTest(off, prefix, next)...) // not in CIDR -> next
@@ -311,7 +346,7 @@ func cidrTest(off int, prefix netip.Prefix, fail string) asm.Instructions {
 		}
 		nw := binary.LittleEndian.Uint32(addr[w*4:]) & mw
 		ins = append(ins,
-			asm.LoadMem(asm.R3, asm.R7, int16(off+w*4), asm.Word),
+			asm.LoadMem(asm.R3, asm.R9, int16(off+w*4), asm.Word),
 			asm.And.Imm(asm.R3, int32(mw)),
 			asm.JNE.Imm32(asm.R3, int32(nw), fail),
 		)
