@@ -148,6 +148,14 @@ func blast(xsk *afxdp.Socket, template []byte, srcPortOff int, startPort uint16,
 	}
 }
 
+// ethWireOverhead is the on-the-wire Ethernet framing not included in a frame
+// length: 7-byte preamble + 1-byte start-frame delimiter + 4-byte FCS + 12-byte
+// interframe gap. Adding it per packet turns counted frame bytes into wire
+// bytes, so Gbit/s reflects link utilization — the difference is large for small
+// frames (a 64-byte frame is 88 bytes on the wire), which is why raw frame bytes
+// badly understate line-rate use at high pps.
+const ethWireOverhead = 24
+
 // report prints the transmit rate once a second until stopped.
 func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, stop *atomic.Bool) {
 	t := time.NewTicker(time.Second)
@@ -163,7 +171,7 @@ func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, stop *atomic.Bool) {
 		}
 		b := bytes.Load()
 		pps := s.TxPackets - lastP
-		gbits := float64(b-lastB) * 8 / 1e9
+		gbits := float64((b-lastB)+pps*ethWireOverhead) * 8 / 1e9 // wire rate
 		log.Printf("%d pps  %.2f Gbit/s", pps, gbits)
 		lastP, lastB = s.TxPackets, b
 	}
