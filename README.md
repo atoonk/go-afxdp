@@ -326,11 +326,16 @@ frames), showing why the mode matters:
 | native XDP (queues + MTU) | lossless, rx == tx, `nic=0 app=0` |
 | native + zero copy (auto 4096 frames) | 5.0M pps flat |
 
-At that point the ceiling is the instance, not the library: transmit is
-CPU-bound in ENA's copy path (there is no zero-copy *acceleration* of small-frame
-TX on ENA), and AWS's Nitro network layer **polices packets-per-second** — the
-`pps_allowance_exceeded` counter in `ethtool -S ens5` climbs once you push past
-the instance's allowance (~5M pps here). Bigger instances raise both limits.
+With everything in place — halved channels, MTU ≤ 3502, and the auto-4096 frames
+giving a `zero-copy, native XDP` banner — `blast → drop` runs a **clean, steady
+5.0M pps** end to end, lossless (`nic=0 app=0` on the receiver). That was the
+number on this instance type in our testing.
+
+At that point the ceiling is the instance, not the library: AWS's Nitro network
+layer **polices packets-per-second**, so past the instance's allowance (~5M pps
+on `c7gn.xlarge`) the `pps_allowance_exceeded` counter in `ethtool -S ens5`
+climbs and the rate flat-lines there regardless of queues or cores. Bigger
+instances raise the allowance.
 
 ## Examples
 
