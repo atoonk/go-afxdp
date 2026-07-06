@@ -131,7 +131,8 @@ AF_XDP needs CAP_NET_RAW (or root) and enough locked memory for the BPF maps
 and UMEM (raise RLIMIT_MEMLOCK, e.g. ulimit -l). Native-driver (XDP_FLAGS_DRV_MODE)
 zero-copy requires driver support; otherwise the kernel falls back to generic
 (SKB) mode, which still works but is slower. Confirm zero-copy with
-Socket.ZeroCopy after binding — some drivers (e.g. AWS ENA) need FrameSize 4096
-and a reduced MTU before they will grant it.
+Socket.ZeroCopy after binding — some drivers need page-sized FrameSize (4096)
+and a reduced MTU before they will grant it. Open sets FrameSize to 4096
+automatically on AWS ENA.
 */
 package afxdp

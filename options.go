@@ -25,10 +25,11 @@ type Options struct {
 
 	// FrameSize is the size in bytes of each UMEM buffer. Default 2048.
 	//
-	// For AF_XDP zero-copy on some drivers (notably AWS ENA) the frame size
-	// must equal the page size, i.e. 4096. If zero-copy bind fails with
-	// EINVAL and the kernel log says "Only page size chunks are supported",
-	// set this to 4096.
+	// For AF_XDP zero-copy on some drivers the frame size must equal the page
+	// size, i.e. 4096; with a smaller frame the bind silently falls back to
+	// copy mode. Open detects this for AWS ENA and defaults FrameSize to 4096
+	// there automatically (unless you set it or force generic mode). On any
+	// other driver whose zero-copy bind needs page-sized chunks, set 4096 here.
 	FrameSize int
 
 	// TxFrames is how many of NumFrames are reserved for the transmit pool.
@@ -198,7 +199,9 @@ func WithUDPPorts(ports ...uint16) Option {
 func WithNumFrames(n int) Option { return func(c *config) { c.opts.NumFrames = n } }
 
 // WithFrameSize sets the size of each UMEM buffer in bytes. Default 2048; use
-// 4096 for zero-copy on drivers that require page-sized frames (e.g. AWS ENA).
+// 4096 for zero-copy on drivers that require page-sized frames. On AWS ENA Open
+// already defaults to 4096, so you only need this to override that or to handle
+// another such driver.
 func WithFrameSize(n int) Option { return func(c *config) { c.opts.FrameSize = n } }
 
 // WithTxFrames sets how many of NumFrames are reserved for the transmit pool.

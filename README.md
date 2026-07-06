@@ -248,7 +248,7 @@ Everything is configured with functional options on `Open`:
 | `WithUDPPorts(p...)` | shorthand for `WithFilter(MatchUDPPort(p...))` |
 | `WithFilter(m...)` | redirect packets matching any of the given matches |
 | `WithNumFrames(n)` | total UMEM buffers, rx + tx (default 4096) |
-| `WithFrameSize(n)` | bytes per buffer (default 2048, use **4096** for ENA zero copy) |
+| `WithFrameSize(n)` | bytes per buffer (default 2048; auto **4096** on ENA for zero copy) |
 | `WithTxFrames(n)` | buffers reserved for transmit (default half) |
 | `WithRingSize(n)` | all four ring sizes, power of two (default 2048) |
 | `WithZeroCopy()` | require native zero copy, `Open` fails if unavailable |
@@ -270,10 +270,67 @@ startup; that is the link relinking, not a hang. (The `blast` example waits for
 the link to come up first, for exactly this reason.) `WithGenericMode` does not
 reset the link, which is handy for quick local tests.
 
-The one option you most often change is `WithFrameSize(4096)` for zero copy on
-drivers that need page-sized frames (AWS ENA). Each socket has its own UMEM of
-`NumFrames * FrameSize` bytes, so memory scales with the queue count; size
-`NumFrames` accordingly on many-queue NICs.
+`WithFrameSize(4096)` gives zero copy on drivers that need page-sized frames;
+Open already applies it on AWS ENA (see below), so you rarely set it by hand.
+Each socket has its own UMEM of `NumFrames * FrameSize` bytes, so memory scales
+with the queue count; size `NumFrames` accordingly on many-queue NICs.
+
+## AWS EC2 / ENA
+
+The `ena` driver (EC2, including the "network optimized" `*n`/`*gn` instances)
+supports native XDP, but only under two conditions — miss either and `Open`
+silently falls back to **generic** XDP, which works but drops packets on the
+floor under load without any counter showing it. `Fleet.Info()` tells you which
+mode you got; if it says `generic` on ENA, fix these two things:
+
+1. **Free up queues for XDP.** Native XDP needs a dedicated transmit ring per
+   channel, carved out of the same fixed hardware queue budget as your normal
+   channels. ENA refuses native attach unless channels are **≤ half** the
+   maximum. EC2 gives you roughly one queue per vCPU, so on a 4-vCPU instance
+   with 4 channels you must halve it:
+   ```
+   ethtool -L ens5 combined 2
+   ```
+   (This is not something the library can avoid — the kernel XDP API has no way
+   to declare "this program never transmits", so the driver reserves TX rings
+   regardless. go-afxdp only ever redirects or passes, never `XDP_TX`, but ENA
+   still requires the headroom.)
+
+2. **Lower the MTU.** Base XDP hands the program one contiguous, page-sized
+   (4 KB) buffer per packet, so a 9001-byte jumbo frame doesn't fit and ENA
+   rejects the attach. Set the MTU under ~3.5 KB:
+   ```
+   ip link set dev ens5 mtu 3000
+   ```
+   (EC2 defaults to jumbo 9001. This is the driver's single-buffer XDP limit,
+   not a library choice; ENA has not yet implemented XDP multi-buffer.)
+
+**Zero copy** on ENA additionally needs page-sized (4096-byte) UMEM frames — with
+the default 2048 the bind silently drops to native *copy* mode. Open handles this
+for you: when it sees the `ena` driver it defaults `FrameSize` to 4096, so with
+the two settings above the banner reads `zero-copy, native XDP` with no code
+change. (Pass `WithFrameSize` yourself only to override that. It costs twice the
+UMEM per queue, which is why 4096 is an ena-only default, not the global one.)
+
+Both `ethtool`/`ip` settings are per-boot; re-apply after a reboot. They are NIC
+config, so set them yourself rather than have the library reconfigure your
+interface underneath you. (The frame-size default is the one thing the library
+*can* safely pick for you, since it only changes its own UMEM, not your NIC.)
+
+Measured on two `c7gn.xlarge` (4 vCPU, 6.1 kernel, `blast` → `drop`, 64-byte
+frames), showing why the mode matters:
+
+| Receiver mode | Result |
+|---------------|--------|
+| generic XDP (default) | ~3.1M rx pps — silently loses ~25% of a 4M pps sender |
+| native XDP (queues + MTU) | lossless, rx == tx, `nic=0 app=0` |
+| native + zero copy (auto 4096 frames) | 5.0M pps flat |
+
+At that point the ceiling is the instance, not the library: transmit is
+CPU-bound in ENA's copy path (there is no zero-copy *acceleration* of small-frame
+TX on ENA), and AWS's Nitro network layer **polices packets-per-second** — the
+`pps_allowance_exceeded` counter in `ethtool -S ens5` climbs once you push past
+the instance's allowance (~5M pps here). Bigger instances raise both limits.
 
 ## Examples
 
@@ -413,8 +470,10 @@ AF_XDP needs `CAP_NET_RAW` (or root) and enough locked memory for the BPF maps a
 UMEM (raise `RLIMIT_MEMLOCK`, e.g. `ulimit -l`). `Open` picks native zero copy
 when the driver supports it and otherwise falls back automatically, so you do not
 have to, and `Fleet.Info()` shows what you got. On AWS ENA, zero copy additionally
-needs `WithFrameSize(4096)` and a non-jumbo MTU (the driver caps XDP MTU at 3502,
-so e.g. `ip link set ens5 mtu 1500`).
+needs page-sized frames (Open defaults `FrameSize` to 4096 there automatically),
+halved channels, and a non-jumbo MTU (the driver caps XDP MTU at 3502, so e.g.
+`ethtool -L ens5 combined 2 && ip link set ens5 mtu 1500`) — see the AWS EC2 / ENA
+section.
 
 ## Credits and license
 

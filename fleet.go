@@ -82,6 +82,16 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 	cfg := newConfig(opts...)
 	base := cfg.opts.withDefaults()
 
+	// AWS ENA's zero-copy datapath requires page-sized (4096-byte) UMEM frames;
+	// with the default 2048 the bind silently falls back to native *copy* mode.
+	// When the caller hasn't chosen a frame size and native/zero-copy is still on
+	// the table, default to 4096 on ena so zero-copy works out of the box. Skipped
+	// for forced generic mode (zero-copy is impossible there, so the bigger frames
+	// would only waste UMEM); an explicit WithFrameSize always wins.
+	if cfg.opts.FrameSize == 0 && cfg.mode != modeGeneric && interfaceDriver(iface) == "ena" {
+		base.FrameSize = 4096
+	}
+
 	if len(cfg.matches) == 0 {
 		return nil, fmt.Errorf("afxdp: Open(%q) needs a filter — without one every packet "+
 			"on the interface would be redirected to your sockets and kept from the kernel "+
