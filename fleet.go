@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -35,6 +37,22 @@ type Fleet struct {
 	program *Program
 	sockets []*Socket
 }
+
+// openFleets pins every Fleet returned by Open until Close is called.
+//
+// This is load-bearing, not bookkeeping: the XDP program is held by a BPF link
+// whose file descriptor is owned by cilium/ebpf objects inside the Fleet, and
+// cilium/ebpf closes those fds from a GC finalizer. A typical application only
+// keeps the per-queue *Sockets after startup (see examples/drop), so without
+// this pin the garbage collector eventually collects the unreachable Fleet,
+// the finalizer closes the link fd, and the kernel silently DETACHES the XDP
+// program — sockets stay bound but receive nothing, with no error anywhere.
+// Pinning here means a Fleet lives until Close() or process exit, which is the
+// only sane lifetime for an attached XDP program.
+var (
+	openFleetsMu sync.Mutex
+	openFleets   = make(map[*Fleet]struct{})
+)
 
 // CountQueues returns the number of rx queues on an interface, i.e. the number
 // of AF_XDP sockets needed to receive all RSS-distributed traffic. It reads
@@ -117,6 +135,14 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 
 	filter := filterDesc(cfg.matches)
 
+	// Even a transmit-only Fleet (MatchNone) needs its XDP program attached:
+	// in principle AF_XDP TX doesn't require one, but in practice drivers only
+	// activate the XSK TX datapath alongside an attached program (ixgbe
+	// allocates its XDP TX rings only then; ENA accepts a program-less
+	// zero-copy bind and then silently never services the TX ring — verified
+	// 2026-07: bind succeeds, completions stall after one burst, nothing hits
+	// the wire). So there is no attach-free fast path to try first.
+
 	// Try each attach mode in preference order. For a given attach mode we
 	// attach the program once (native attach blips the link), then try its
 	// bind variants (zero-copy before copy) without re-attaching.
@@ -131,7 +157,6 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 			lastErr = fmt.Errorf("%s attach: %w", g.label, err)
 			continue
 		}
-		bound := false
 		for _, bindFlags := range g.bindFlags {
 			opts := base
 			opts.BindFlags = bindFlags
@@ -141,9 +166,12 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 				lastErr = fmt.Errorf("%s bind: %w", g.label, err)
 				continue
 			}
-			return &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter, program: prog, sockets: socks}, nil
+			f := &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter, program: prog, sockets: socks}
+			openFleetsMu.Lock()
+			openFleets[f] = struct{}{}
+			openFleetsMu.Unlock()
+			return f, nil
 		}
-		_ = bound
 		prog.Detach(ifindex)
 		prog.Close()
 	}
@@ -221,6 +249,35 @@ func OpenFleet(iface string, options *Options) (*Fleet, error) {
 	return Open(iface, WithOptions(*options))
 }
 
+// WaitLinkUp blocks until the Fleet's interface is operationally up, or the
+// timeout elapses; it reports whether the link is up.
+//
+// Attaching a native XDP program makes many drivers (ixgbe, for one)
+// reinitialize their rings, which bounces the physical link for several
+// seconds while it renegotiates. Until carrier returns nothing is received
+// and anything transmitted is lost, so call this after Open — on senders and
+// receivers alike — before starting traffic or judging counters. The link
+// must hold up for about a second of consecutive readings before this
+// returns: the attach-induced flap can begin a moment after Open returns, so
+// a single instantaneous "up" could race it.
+func (f *Fleet) WaitLinkUp(timeout time.Duration) bool {
+	const stable = 5 // consecutive 200ms "up" readings required
+	up := 0
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		l, err := netlink.LinkByIndex(f.ifindex)
+		if err == nil && l.Attrs().OperState == netlink.OperUp {
+			if up++; up >= stable {
+				return true
+			}
+		} else {
+			up = 0
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
 // Sockets returns the per-queue sockets, indexed by queue ID.
 func (f *Fleet) Sockets() []*Socket { return f.sockets }
 
@@ -243,6 +300,9 @@ func (f *Fleet) Program() *Program { return f.program }
 // releases its maps. It returns the first error encountered but always
 // attempts every step.
 func (f *Fleet) Close() error {
+	openFleetsMu.Lock()
+	delete(openFleets, f)
+	openFleetsMu.Unlock()
 	var firstErr error
 	for q, xsk := range f.sockets {
 		if f.program != nil {

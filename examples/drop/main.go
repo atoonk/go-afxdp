@@ -54,6 +54,15 @@ func main() {
 		log.Printf("dropping UDP/%d: %s", *port, info)
 	}
 
+	// Attaching native XDP bounces the link on many NICs (~10s on ixgbe).
+	// Wait it out before printing counters, so a "0 rx pps" line always means
+	// "link up but no traffic" rather than "link still renegotiating".
+	if fleet.WaitLinkUp(15 * time.Second) {
+		log.Printf("link up")
+	} else {
+		log.Printf("warning: %s not up after 15s; counting anyway", *iface)
+	}
+
 	// Summing frame lengths is the only per-packet work we do (for the bit/s
 	// figure); packet counts come from Fleet.Stats with no bookkeeping at all.
 	var bytes atomic.Uint64

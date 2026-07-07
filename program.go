@@ -213,7 +213,17 @@ func removeProgram(ifindex int) error {
 		return nil
 	}
 	if err := netlink.LinkSetXdpFd(link, -1); err != nil {
-		return fmt.Errorf("afxdp: detach XDP program: %w", err)
+		// The usual cause: the attached program belongs to a live process that
+		// holds it via a BPF link, which netlink cannot remove — another
+		// XDP/AF_XDP app owns this interface right now. Name the program so
+		// the owner can be tracked down (bpftool prog show id N, or scan
+		// /proc/*/fd for bpf holders) instead of surfacing a bare EBUSY.
+		id := uint32(0)
+		if a := link.Attrs(); a != nil && a.Xdp != nil {
+			id = a.Xdp.ProgId
+		}
+		return fmt.Errorf("afxdp: XDP program id %d is already attached to %s and cannot be removed — likely owned by another running process; stop that process first: %w",
+			id, link.Attrs().Name, err)
 	}
 	for {
 		link, err = netlink.LinkByIndex(ifindex)

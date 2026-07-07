@@ -126,7 +126,7 @@ func l3Base(label, next string) asm.Instructions {
 	return append(ins,
 		asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
 		asm.JNE.Imm(asm.R3, etherTypeVLANLE, notag),
-		asm.Add.Imm(asm.R9, 4),                       // step over the 4-byte tag
+		asm.Add.Imm(asm.R9, 4),                        // step over the 4-byte tag
 		asm.Mov.Reg(asm.R9, asm.R9).WithSymbol(notag), // no-op landing pad for the label
 	)
 }

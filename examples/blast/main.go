@@ -86,7 +86,7 @@ func main() {
 	// Native XDP attach resets the NIC; on ixgbe and similar the 10G link then
 	// renegotiates for several seconds, during which nothing can transmit. Wait
 	// for it to come back up so -duration is time spent actually blasting.
-	if waitLinkUp(*iface, 15*time.Second) {
+	if fleet.WaitLinkUp(15 * time.Second) {
 		log.Printf("link up; blasting for %s", *duration)
 	} else {
 		log.Printf("warning: %s not up after 15s; transmitting anyway", *iface)
@@ -219,19 +219,6 @@ func buildFrame(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, dstPort ui
 	binary.BigEndian.PutUint16(f[udp+4:], uint16(size-udp)) // UDP length
 	// UDP checksum (f[udp+6:udp+8]) left zero.
 	return f, udp
-}
-
-// waitLinkUp polls until the interface is operationally up, or the timeout
-// elapses. It returns whether the link came up.
-func waitLinkUp(iface string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if l, err := netlink.LinkByName(iface); err == nil && l.Attrs().OperState == netlink.OperUp {
-			return true
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return false
 }
 
 func ipChecksum(hdr []byte) uint16 {
