@@ -1,3 +1,5 @@
+//go:build linux
+
 // blast is a UDP packet generator built on AF_XDP: it builds a UDP frame
 // directly in the UMEM and transmits it as fast as the NIC will go, across
 // every tx queue. It's the sender counterpart to the drop example — point one

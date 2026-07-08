@@ -1,3 +1,5 @@
+//go:build linux
+
 // multiqueue captures traffic across every rx queue on an interface at once.
 // It opens a Fleet (one AF_XDP socket per queue, all under one XDP program),
 // runs one goroutine per queue, and prints the aggregate packet rate each

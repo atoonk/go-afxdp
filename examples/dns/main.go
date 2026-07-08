@@ -1,3 +1,5 @@
+//go:build linux
+
 // dns is a small UDP DNS forwarding resolver built on AF_XDP. It answers DNS
 // queries sent to this host on UDP/53 by forwarding them to an upstream
 // resolver (8.8.8.8 by default, which does the actual recursion) and sending

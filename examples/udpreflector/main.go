@@ -1,3 +1,5 @@
+//go:build linux
+
 // udpreflector bounces UDP packets back to their sender. It binds the given
 // UDP port across one or more rx queues with a single call to afxdp.Open, then
 // for every packet swaps the Ethernet, IPv4, and UDP src/dst fields and

@@ -1,3 +1,5 @@
+//go:build linux
+
 // drop is a UDP packet sink: it receives every packet sent to a UDP port and
 // throws it away. Because it does almost no work per packet, it's a handy way
 // to measure how fast this library (and your NIC) can pull packets into

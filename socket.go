@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright 2024 Andree Toonk. All rights reserved.
 // Portions Copyright 2019 Asavie Technologies Ltd.
 // Use of this source code is governed by a BSD-style license that can be
@@ -171,7 +173,7 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		Size:     uint32(opts.FrameSize),
 		Headroom: 0,
 	}
-	if rc, _, errno := unix.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(xsk.fd),
+	if rc, _, errno := unix.Syscall6(unix.SYS_SETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_UMEM_REG,
 		uintptr(unsafe.Pointer(&xdpUmemReg)), unsafe.Sizeof(xdpUmemReg), 0); rc != 0 {
 		xsk.Close()
@@ -208,7 +210,7 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 
 	var offsets unix.XDPMmapOffsets
 	vallen := uint32(unsafe.Sizeof(offsets))
-	if rc, _, errno := unix.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(xsk.fd),
+	if rc, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_MMAP_OFFSETS,
 		uintptr(unsafe.Pointer(&offsets)), uintptr(unsafe.Pointer(&vallen)), 0); rc != 0 {
 		xsk.Close()
@@ -472,7 +474,7 @@ func (xsk *Socket) Transmit(descs []Desc) int {
 // harmless.)
 func (xsk *Socket) Kick() error {
 	for {
-		rc, _, errno := unix.Syscall6(syscall.SYS_SENDTO, uintptr(xsk.fd),
+		rc, _, errno := unix.Syscall6(unix.SYS_SENDTO, uintptr(xsk.fd),
 			0, 0, uintptr(unix.MSG_DONTWAIT), 0, 0)
 		if rc == 0 {
 			return nil
@@ -626,7 +628,7 @@ func (xsk *Socket) Stats() (Stats, error) {
 	}
 	xsk.statsMu.Unlock()
 	size := uint64(unsafe.Sizeof(s.KernelStats))
-	if rc, _, errno := unix.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(xsk.fd),
+	if rc, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_STATISTICS,
 		uintptr(unsafe.Pointer(&s.KernelStats)), uintptr(unsafe.Pointer(&size)), 0); rc != 0 {
 		return s, fmt.Errorf("afxdp: XDP_STATISTICS: %w", errno)

@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright 2024 Andree Toonk. All rights reserved.
 // Portions Copyright 2019 Asavie Technologies Ltd.
 // Use of this source code is governed by a BSD-style license that can be

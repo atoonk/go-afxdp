@@ -1,3 +1,5 @@
+//go:build linux
+
 // helloworld is the smallest afxdp program: it captures ICMP echo (ping)
 // packets on an interface and prints a one-line summary of each, plus periodic
 // stats.

@@ -1,3 +1,5 @@
+//go:build linux
+
 // l2fwd is a minimal L2 reflector: it receives frames on one queue, swaps the
 // source and destination MAC addresses, and transmits them back out the same
 // interface. It exercises both the receive and transmit paths.
