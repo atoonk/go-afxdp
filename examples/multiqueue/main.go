@@ -63,6 +63,15 @@ func main() {
 		log.Print(info)
 	}
 
+	// Native XDP attach bounces the link on many NICs (~10s on ixgbe); wait
+	// for it so the quiet start doesn't read as "receiving nothing".
+	log.Printf("waiting for the link to come up...")
+	if fleet.WaitLinkUp(15 * time.Second) {
+		log.Printf("link up")
+	} else {
+		log.Printf("warning: link not up after 15s; continuing anyway")
+	}
+
 	// The receive goroutines just drain their queue — no counting. The Fleet
 	// tracks packet and drop counters for us; we read them with Stats() below.
 	stop := make(chan struct{})
@@ -75,7 +84,7 @@ func main() {
 				default:
 				}
 				xsk.Fill(xsk.NumFreeFillSlots())
-				nrx, err := xsk.Poll(200) // 200ms so we notice stop
+				nrx, err := xsk.Poll(200 * time.Millisecond) // short timeout so we notice stop
 				if err != nil {
 					return
 				}

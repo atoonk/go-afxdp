@@ -9,9 +9,11 @@ package afxdp
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -66,11 +68,23 @@ type rxTxRing struct {
 //     each producer its own Socket/queue via a Fleet.
 //   - The receive side is single-consumer; likewise guard it if you fan out
 //     receive across goroutines.
+//   - Close is the exception: it may be called from any goroutine at any
+//     time. It wakes a blocked Poll (which returns net.ErrClosed) and waits
+//     for in-flight calls to finish before releasing the shared memory.
 type Socket struct {
 	fd      int
 	ifindex int
 	options Options
 	umem    []byte
+
+	// Shutdown machinery. closing flips once, in Close. wakeFd is an eventfd
+	// included in Poll's fd set so Close can wake a blocked poller. ops counts
+	// in-flight method calls; Close waits for it to drain before unmapping the
+	// rings those methods read, so a concurrent Close is safe rather than a
+	// use-after-munmap.
+	closing atomic.Bool
+	ops     atomic.Int64
+	wakeFd  int
 
 	// ringMems holds the raw mmap regions backing the four rings so Close can
 	// munmap them; the ring structs below alias into these mappings.
@@ -118,6 +132,25 @@ func (c *ringCounter) update(cur uint32) uint64 {
 	return c.total
 }
 
+// incref registers an in-flight operation, refusing if the Socket is closing.
+// Methods that touch the fd or the ring mappings bracket themselves with
+// incref/decref so Close can wait for them before tearing those down. The
+// double check closes the race where Close flips the flag between our check
+// and our increment.
+func (xsk *Socket) incref() bool {
+	if xsk.closing.Load() {
+		return false
+	}
+	xsk.ops.Add(1)
+	if xsk.closing.Load() {
+		xsk.ops.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (xsk *Socket) decref() { xsk.ops.Add(-1) }
+
 // NewSocket creates an AF_XDP socket on the given interface index and queue ID.
 // Pass nil options for defaults (see DefaultOptions). After creating the
 // socket you must register its FD with an attached Program (or use OpenFleet,
@@ -151,12 +184,20 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 			opts.FillRingNumDescs, rxPool)
 	}
 
-	xsk := &Socket{fd: -1, ifindex: ifindex, options: opts}
+	xsk := &Socket{fd: -1, ifindex: ifindex, options: opts, wakeFd: -1}
 
 	var err error
 	xsk.fd, err = syscall.Socket(unix.AF_XDP, syscall.SOCK_RAW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("afxdp: AF_XDP socket: %w", err)
+	}
+
+	// The wake eventfd rides along in Poll's fd set so Close can interrupt a
+	// blocked poller instead of closing the socket fd out from under it.
+	xsk.wakeFd, err = unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		xsk.Close()
+		return nil, fmt.Errorf("afxdp: eventfd: %w", err)
 	}
 
 	xsk.umem, err = syscall.Mmap(-1, 0, opts.NumFrames*opts.FrameSize,
@@ -321,6 +362,10 @@ func (xsk *Socket) frameBase(addr uint64) uint64 {
 // submitted, which may be less than n if the receive pool or the fill ring is
 // short on space. Call it before Poll so the kernel always has buffers.
 func (xsk *Socket) Fill(n int) int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	if free := xsk.NumFreeFillSlots(); n > free {
 		n = free
 	}
@@ -340,20 +385,42 @@ func (xsk *Socket) Fill(n int) int {
 	return len(addrs)
 }
 
-// Poll blocks until the kernel has received frames (or the timeout, in
-// milliseconds, elapses; negative means wait forever). It returns the number
-// of received frames now available to Receive. Poll only watches the receive
-// direction; the transmit side drives completions via Complete/Kick.
-func (xsk *Socket) Poll(timeoutMs int) (numReceived int, err error) {
+// Poll blocks until the kernel has received frames, the timeout elapses, or
+// the Socket is closed. A negative timeout waits forever; zero returns
+// immediately. It returns the number of received frames now available to
+// Receive. Poll only watches the receive direction; the transmit side drives
+// completions via Complete/Kick.
+//
+// Close from another goroutine wakes a blocked Poll, which then returns
+// net.ErrClosed — so a receive loop that stops on any Poll error shuts down
+// cleanly.
+func (xsk *Socket) Poll(timeout time.Duration) (numReceived int, err error) {
+	if !xsk.incref() {
+		return 0, net.ErrClosed
+	}
+	defer xsk.decref()
 	if xsk.numFilled == 0 {
 		return 0, nil
 	}
-	pfds := [1]unix.PollFd{{Fd: int32(xsk.fd), Events: unix.POLLIN}}
+	ms := -1
+	if timeout >= 0 {
+		ms = int(timeout / time.Millisecond)
+		if ms == 0 && timeout > 0 {
+			ms = 1 // don't turn a small positive timeout into "don't block"
+		}
+	}
+	pfds := [2]unix.PollFd{
+		{Fd: int32(xsk.fd), Events: unix.POLLIN},
+		{Fd: int32(xsk.wakeFd), Events: unix.POLLIN},
+	}
 	for err = unix.EINTR; err == unix.EINTR; {
-		_, err = unix.Poll(pfds[:], timeoutMs)
+		_, err = unix.Poll(pfds[:], ms)
 	}
 	if err != nil {
 		return 0, err
+	}
+	if pfds[1].Revents != 0 { // woken by Close
+		return 0, net.ErrClosed
 	}
 	return xsk.NumReceived(), nil
 }
@@ -363,6 +430,10 @@ func (xsk *Socket) Poll(timeoutMs int) (numReceived int, err error) {
 // copy out anything you need to keep. After you are done reading the frames,
 // return them with Recycle so they can be filled again.
 func (xsk *Socket) Receive(max int) []Desc {
+	if !xsk.incref() {
+		return nil
+	}
+	defer xsk.decref()
 	avail := xsk.NumReceived()
 	if max > avail {
 		max = avail
@@ -392,6 +463,10 @@ func (xsk *Socket) Recycle(descs []Desc) {
 // NumFreeFillSlots returns how many descriptors can still be put on the fill
 // ring before it is full.
 func (xsk *Socket) NumFreeFillSlots() int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	prod := ldIdx(xsk.fillRing.Producer)
 	cons := ldIdx(xsk.fillRing.Consumer)
 	max := uint32(xsk.options.FillRingNumDescs)
@@ -403,6 +478,10 @@ func (xsk *Socket) NumFreeFillSlots() int {
 
 // NumReceived returns how many received descriptors are waiting on the rx ring.
 func (xsk *Socket) NumReceived() int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	n := ldIdx(xsk.rxRing.Producer) - ldIdx(xsk.rxRing.Consumer) // acquire on producer
 	if max := uint32(xsk.options.RxRingNumDescs); n > max {
 		n = max
@@ -430,6 +509,10 @@ func (xsk *Socket) FreeRxFrames() int { return xsk.rxPool.len() }
 // full. Capping to the free ring space means Transmit can always queue every
 // descriptor Alloc returns, so none are dropped and leaked back out of the pool.
 func (xsk *Socket) Alloc(n int) []Desc {
+	if !xsk.incref() {
+		return nil
+	}
+	defer xsk.decref()
 	if free := xsk.NumFreeTxSlots(); n > free {
 		n = free
 	}
@@ -446,6 +529,10 @@ func (xsk *Socket) Alloc(n int) []Desc {
 // space). Frames that are queued are owned by the kernel until they appear on
 // the completion ring; reclaim them with Complete.
 func (xsk *Socket) Transmit(descs []Desc) int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	if free := xsk.NumFreeTxSlots(); len(descs) > free {
 		descs = descs[:free]
 	}
@@ -473,6 +560,10 @@ func (xsk *Socket) Transmit(descs []Desc) int {
 // deadlocks. (In zero-copy the driver drains on its own, but kicking is
 // harmless.)
 func (xsk *Socket) Kick() error {
+	if !xsk.incref() {
+		return net.ErrClosed
+	}
+	defer xsk.decref()
 	for {
 		rc, _, errno := unix.Syscall6(unix.SYS_SENDTO, uintptr(xsk.fd),
 			0, 0, uintptr(unix.MSG_DONTWAIT), 0, 0)
@@ -496,6 +587,10 @@ func (xsk *Socket) Kick() error {
 // returns them to the transmit pool, making them available to Alloc again.
 // It returns how many frames were reclaimed.
 func (xsk *Socket) Complete(n int) int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	avail := xsk.NumCompleted()
 	if n > avail {
 		n = avail
@@ -514,6 +609,10 @@ func (xsk *Socket) Complete(n int) int {
 
 // NumFreeTxSlots returns how many descriptors can still be put on the tx ring.
 func (xsk *Socket) NumFreeTxSlots() int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	prod := ldIdx(xsk.txRing.Producer)
 	cons := ldIdx(xsk.txRing.Consumer)
 	max := uint32(xsk.options.TxRingNumDescs)
@@ -526,6 +625,10 @@ func (xsk *Socket) NumFreeTxSlots() int {
 // NumCompleted returns how many transmitted frames are waiting on the
 // completion ring to be reclaimed by Complete.
 func (xsk *Socket) NumCompleted() int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	n := ldIdx(xsk.completionRing.Producer) - ldIdx(xsk.completionRing.Consumer) // acquire on producer
 	if max := uint32(xsk.options.CompletionRingNumDescs); n > max {
 		n = max
@@ -562,6 +665,10 @@ func (xsk *Socket) SendBatch(payloads [][]byte) int {
 // directly in the UMEM or vary a field per packet (e.g. a packet generator). It
 // handles the same ring bookkeeping as SendBatch and returns the number queued.
 func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) int {
+	if !xsk.incref() {
+		return 0
+	}
+	defer xsk.decref()
 	xsk.Complete(xsk.NumCompleted()) // reclaim already-sent frames
 	free := xsk.NumFreeTxSlots()
 	if free == 0 {
@@ -614,6 +721,10 @@ func (s Stats) String() string {
 // Stats at least once per 2^32 packets per socket (at 10G line rate on one
 // queue that's every ~5 minutes — any periodic stats loop is plenty).
 func (xsk *Socket) Stats() (Stats, error) {
+	if !xsk.incref() {
+		return Stats{}, net.ErrClosed
+	}
+	defer xsk.decref()
 	var s Stats
 	xsk.statsMu.Lock()
 	s.Filled = xsk.statFilled.update(ldIdx(xsk.fillRing.Consumer))
@@ -640,6 +751,10 @@ func (xsk *Socket) Stats() (Stats, error) {
 // It reads XDP_OPTIONS, the authoritative source — bind flags only request a
 // mode, they do not confirm it.
 func (xsk *Socket) ZeroCopy() (bool, error) {
+	if !xsk.incref() {
+		return false, net.ErrClosed
+	}
+	defer xsk.decref()
 	opt, err := unix.GetsockoptInt(xsk.fd, unix.SOL_XDP, unix.XDP_OPTIONS)
 	if err != nil {
 		return false, fmt.Errorf("afxdp: XDP_OPTIONS: %w", err)
@@ -647,14 +762,38 @@ func (xsk *Socket) ZeroCopy() (bool, error) {
 	return opt&unix.XDP_OPTIONS_ZEROCOPY != 0, nil
 }
 
-// Close releases the socket, its UMEM, and ring mappings.
+// Close releases the socket, its UMEM, and ring mappings. It is safe to call
+// while another goroutine is blocked in Poll: that Poll is woken and returns
+// net.ErrClosed, and Close waits for in-flight operations to finish before
+// tearing down the memory they use. After Close, all methods are inert
+// (Poll/Kick/Stats return net.ErrClosed; the rest return zero values) — but
+// frame slices previously handed out by GetFrame must no longer be touched.
 func (xsk *Socket) Close() error {
+	if xsk.closing.Swap(true) {
+		return nil // second Close: the first one did (or is doing) the work
+	}
+	// Wake any poller, then wait for every in-flight method call to drain
+	// before invalidating the fds and mappings they might be using.
+	if xsk.wakeFd != -1 {
+		var one = [8]byte{1} // eventfd counter increment, little-endian 1
+		_, _ = unix.Write(xsk.wakeFd, one[:])
+	}
+	for xsk.ops.Load() > 0 {
+		time.Sleep(100 * time.Microsecond)
+	}
+
 	var firstErr error
 	if xsk.fd != -1 {
 		if err := unix.Close(xsk.fd); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("afxdp: close socket: %w", err)
 		}
 		xsk.fd = -1
+	}
+	if xsk.wakeFd != -1 {
+		if err := unix.Close(xsk.wakeFd); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("afxdp: close eventfd: %w", err)
+		}
+		xsk.wakeFd = -1
 	}
 	// Drop every alias into the ring mappings before unmapping them.
 	xsk.fillRing = umemRing{}

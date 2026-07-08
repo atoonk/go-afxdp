@@ -78,7 +78,10 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
-	log.Println("stopping")
+	// Close wakes every goroutine blocked in Poll (they see net.ErrClosed and
+	// return), detaches the XDP program, and releases the sockets.
+	fleet.Close()
+	log.Println("stopped")
 }
 
 // drop is one queue's receive-and-discard loop: hand the kernel buffers, wait

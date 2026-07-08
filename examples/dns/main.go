@@ -68,6 +68,15 @@ func main() {
 		log.Printf("DNS resolver up (upstream %s, %d workers/queue): %s", *upstream, *workers, info)
 	}
 
+	// Native XDP attach bounces the link on many NICs (~10s on ixgbe); wait
+	// for it so the quiet start doesn't read as "receiving nothing".
+	log.Printf("waiting for the link to come up...")
+	if fleet.WaitLinkUp(15 * time.Second) {
+		log.Printf("link up")
+	} else {
+		log.Printf("warning: link not up after 15s; continuing anyway")
+	}
+
 	for _, xsk := range fleet.Sockets() {
 		go serve(xsk, *upstream, *workers, *verbose)
 	}

@@ -48,6 +48,15 @@ func main() {
 		log.Printf("started: %s", info)
 	}
 
+	// Native XDP attach bounces the link on many NICs (~10s on ixgbe); wait
+	// for it so the quiet start doesn't read as "receiving nothing".
+	log.Printf("waiting for the link to come up...")
+	if fleet.WaitLinkUp(15 * time.Second) {
+		log.Printf("link up")
+	} else {
+		log.Printf("warning: link not up after 15s; continuing anyway")
+	}
+
 	// One receive goroutine per queue: Fill -> Poll -> Receive -> Recycle.
 	for _, xsk := range fleet.Sockets() {
 		go func(xsk *afxdp.Socket) {
@@ -82,13 +91,15 @@ func main() {
 		}
 	}()
 
-	// Wait for Ctrl-C, then exit. Open attached via a BPF link, so the kernel
-	// auto-detaches the XDP program when this process exits (Linux >= 5.9).
-	// Call fleet.Close() if you want to detach explicitly.
+	// Wait for Ctrl-C, then shut down. Close wakes the receive goroutines
+	// blocked in Poll (they see net.ErrClosed and return) and detaches the
+	// XDP program. (The kernel would also auto-detach on process exit — the
+	// program is held by a BPF link — but explicit Close is the tidy way.)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
-	log.Println("stopping")
+	fleet.Close()
+	log.Println("stopped")
 }
 
 // summary renders a one-line description of an Ethernet frame.

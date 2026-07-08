@@ -59,6 +59,15 @@ func main() {
 	}
 	defer fleet.Close()
 	log.Printf("reflecting UDP/%d on %s", *port, *iface)
+
+	// Native XDP attach bounces the link on many NICs (~10s on ixgbe); wait
+	// for it so the quiet start doesn't read as "receiving nothing".
+	log.Printf("waiting for the link to come up...")
+	if fleet.WaitLinkUp(15 * time.Second) {
+		log.Printf("link up")
+	} else {
+		log.Printf("warning: link not up after 15s; continuing anyway")
+	}
 	if info, err := fleet.Info(); err == nil {
 		log.Print(info) // e.g. eth0: 4 queues, zero-copy, native XDP, 4096x2048B frames
 	}
