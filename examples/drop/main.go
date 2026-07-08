@@ -57,6 +57,7 @@ func main() {
 	// Attaching native XDP bounces the link on many NICs (~10s on ixgbe).
 	// Wait it out before printing counters, so a "0 rx pps" line always means
 	// "link up but no traffic" rather than "link still renegotiating".
+	log.Printf("waiting for the link to come up (native XDP attach bounces it, ~10s on some NICs)...")
 	if fleet.WaitLinkUp(15 * time.Second) {
 		log.Printf("link up")
 	} else {

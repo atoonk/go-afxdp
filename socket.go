@@ -7,7 +7,7 @@ package afxdp
 
 import (
 	"fmt"
-	"reflect"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -70,6 +70,10 @@ type Socket struct {
 	options Options
 	umem    []byte
 
+	// ringMems holds the raw mmap regions backing the four rings so Close can
+	// munmap them; the ring structs below alias into these mappings.
+	ringMems [][]byte
+
 	fillRing       umemRing
 	rxRing         rxTxRing
 	txRing         rxTxRing
@@ -86,6 +90,30 @@ type Socket struct {
 	txScratch      []Desc
 	txPopScratch   []uint64
 	numTransmitted int
+
+	// Stats-side state: the kernel's ring indices are 32-bit and wrap every
+	// 2^32 packets (~5 minutes at 10G line rate), so Stats extends them to
+	// 64-bit here. Guarded by statsMu — only the Stats path takes it, the
+	// rx/tx data paths never do.
+	statsMu         sync.Mutex
+	statFilled      ringCounter
+	statReceived    ringCounter
+	statTransmitted ringCounter
+	statCompleted   ringCounter
+}
+
+// ringCounter extends a wrapping 32-bit ring index into a monotonic 64-bit
+// count. The uint32 subtraction makes wrap-around come out right, provided
+// fewer than 2^32 packets pass between updates.
+type ringCounter struct {
+	last  uint32
+	total uint64
+}
+
+func (c *ringCounter) update(cur uint32) uint64 {
+	c.total += uint64(cur - c.last)
+	c.last = cur
+	return c.total
 }
 
 // NewSocket creates an AF_XDP socket on the given interface index and queue ID.
@@ -187,63 +215,63 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		return nil, fmt.Errorf("afxdp: XDP_MMAP_OFFSETS: %w", errno)
 	}
 
-	// Fill ring.
-	fillRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_FILL_RING,
-		int(offsets.Fr.Desc+uint64(opts.FillRingNumDescs)*uint64(unsafe.Sizeof(uint64(0)))),
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("afxdp: mmap fill ring: %w", err)
-	}
-	xsk.fillRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Producer)))
-	xsk.fillRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Consumer)))
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&xsk.fillRing.Descs))
-	sh.Data = uintptr(unsafe.Pointer(&fillRingSlice[0])) + uintptr(offsets.Fr.Desc)
-	sh.Len, sh.Cap = opts.FillRingNumDescs, opts.FillRingNumDescs
-
-	// Completion ring.
-	compRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_UMEM_PGOFF_COMPLETION_RING,
-		int(offsets.Cr.Desc+uint64(opts.CompletionRingNumDescs)*uint64(unsafe.Sizeof(uint64(0)))),
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED|syscall.MAP_POPULATE)
-	if err != nil {
-		xsk.Close()
-		return nil, fmt.Errorf("afxdp: mmap completion ring: %w", err)
-	}
-	xsk.completionRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&compRingSlice[0])) + uintptr(offsets.Cr.Producer)))
-	xsk.completionRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&compRingSlice[0])) + uintptr(offsets.Cr.Consumer)))
-	sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.completionRing.Descs))
-	sh.Data = uintptr(unsafe.Pointer(&compRingSlice[0])) + uintptr(offsets.Cr.Desc)
-	sh.Len, sh.Cap = opts.CompletionRingNumDescs, opts.CompletionRingNumDescs
-
-	if hasRx {
-		rxRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_RX_RING,
-			int(offsets.Rx.Desc+uint64(opts.RxRingNumDescs)*uint64(unsafe.Sizeof(Desc{}))),
+	// Map each ring the kernel allocated and slice its descriptor array. The
+	// mappings are retained in ringMems so Close can munmap them.
+	mapRing := func(pgoff int64, size int, what string) (unsafe.Pointer, error) {
+		mem, err := syscall.Mmap(xsk.fd, pgoff, size,
 			syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED|syscall.MAP_POPULATE)
 		if err != nil {
-			xsk.Close()
-			return nil, fmt.Errorf("afxdp: mmap rx ring: %w", err)
+			return nil, fmt.Errorf("afxdp: mmap %s ring: %w", what, err)
 		}
-		xsk.rxRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Producer)))
-		xsk.rxRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Consumer)))
-		sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.rxRing.Descs))
-		sh.Data = uintptr(unsafe.Pointer(&rxRingSlice[0])) + uintptr(offsets.Rx.Desc)
-		sh.Len, sh.Cap = opts.RxRingNumDescs, opts.RxRingNumDescs
+		xsk.ringMems = append(xsk.ringMems, mem)
+		return unsafe.Pointer(&mem[0]), nil
+	}
+
+	// Fill ring.
+	base, err := mapRing(unix.XDP_UMEM_PGOFF_FILL_RING,
+		int(offsets.Fr.Desc+uint64(opts.FillRingNumDescs)*uint64(unsafe.Sizeof(uint64(0)))), "fill")
+	if err != nil {
+		xsk.Close()
+		return nil, err
+	}
+	xsk.fillRing.Producer = (*uint32)(unsafe.Add(base, offsets.Fr.Producer))
+	xsk.fillRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Fr.Consumer))
+	xsk.fillRing.Descs = unsafe.Slice((*uint64)(unsafe.Add(base, offsets.Fr.Desc)), opts.FillRingNumDescs)
+
+	// Completion ring.
+	base, err = mapRing(unix.XDP_UMEM_PGOFF_COMPLETION_RING,
+		int(offsets.Cr.Desc+uint64(opts.CompletionRingNumDescs)*uint64(unsafe.Sizeof(uint64(0)))), "completion")
+	if err != nil {
+		xsk.Close()
+		return nil, err
+	}
+	xsk.completionRing.Producer = (*uint32)(unsafe.Add(base, offsets.Cr.Producer))
+	xsk.completionRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Cr.Consumer))
+	xsk.completionRing.Descs = unsafe.Slice((*uint64)(unsafe.Add(base, offsets.Cr.Desc)), opts.CompletionRingNumDescs)
+
+	if hasRx {
+		base, err = mapRing(unix.XDP_PGOFF_RX_RING,
+			int(offsets.Rx.Desc+uint64(opts.RxRingNumDescs)*uint64(unsafe.Sizeof(Desc{}))), "rx")
+		if err != nil {
+			xsk.Close()
+			return nil, err
+		}
+		xsk.rxRing.Producer = (*uint32)(unsafe.Add(base, offsets.Rx.Producer))
+		xsk.rxRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Rx.Consumer))
+		xsk.rxRing.Descs = unsafe.Slice((*Desc)(unsafe.Add(base, offsets.Rx.Desc)), opts.RxRingNumDescs)
 		xsk.rxScratch = make([]Desc, 0, opts.RxRingNumDescs)
 	}
 
 	if hasTx {
-		txRingSlice, err := syscall.Mmap(xsk.fd, unix.XDP_PGOFF_TX_RING,
-			int(offsets.Tx.Desc+uint64(opts.TxRingNumDescs)*uint64(unsafe.Sizeof(Desc{}))),
-			syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED|syscall.MAP_POPULATE)
+		base, err = mapRing(unix.XDP_PGOFF_TX_RING,
+			int(offsets.Tx.Desc+uint64(opts.TxRingNumDescs)*uint64(unsafe.Sizeof(Desc{}))), "tx")
 		if err != nil {
 			xsk.Close()
-			return nil, fmt.Errorf("afxdp: mmap tx ring: %w", err)
+			return nil, err
 		}
-		xsk.txRing.Producer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Producer)))
-		xsk.txRing.Consumer = (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Consumer)))
-		sh = (*reflect.SliceHeader)(unsafe.Pointer(&xsk.txRing.Descs))
-		sh.Data = uintptr(unsafe.Pointer(&txRingSlice[0])) + uintptr(offsets.Tx.Desc)
-		sh.Len, sh.Cap = opts.TxRingNumDescs, opts.TxRingNumDescs
+		xsk.txRing.Producer = (*uint32)(unsafe.Add(base, offsets.Tx.Producer))
+		xsk.txRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Tx.Consumer))
+		xsk.txRing.Descs = unsafe.Slice((*Desc)(unsafe.Add(base, offsets.Tx.Desc)), opts.TxRingNumDescs)
 		xsk.txScratch = make([]Desc, 0, opts.TxRingNumDescs)
 	}
 
@@ -576,21 +604,27 @@ func (s Stats) String() string {
 // Stats returns ring counters plus the kernel's XDP_STATISTICS for this socket
 // (which reports e.g. invalid descriptors and rx ring full drops).
 //
-// Stats is a lock-free snapshot: it may be called from a separate monitoring
-// goroutine while the rx/tx loops run, in which case a sample can be momentarily
-// stale, but it never corrupts the data path.
+// Stats may be called from a separate monitoring goroutine while the rx/tx
+// loops run — a sample can be momentarily stale, but it never disturbs the
+// data path (the data path takes no locks; only concurrent Stats callers
+// serialize against each other). The kernel's ring indices are 32-bit, so the
+// 64-bit counters here are maintained across wrap-arounds by sampling; call
+// Stats at least once per 2^32 packets per socket (at 10G line rate on one
+// queue that's every ~5 minutes — any periodic stats loop is plenty).
 func (xsk *Socket) Stats() (Stats, error) {
 	var s Stats
-	s.Filled = uint64(ldIdx(xsk.fillRing.Consumer))
+	xsk.statsMu.Lock()
+	s.Filled = xsk.statFilled.update(ldIdx(xsk.fillRing.Consumer))
 	if xsk.rxRing.Consumer != nil {
-		s.Received = uint64(ldIdx(xsk.rxRing.Consumer))
+		s.Received = xsk.statReceived.update(ldIdx(xsk.rxRing.Consumer))
 	}
 	if xsk.txRing.Consumer != nil {
-		s.Transmitted = uint64(ldIdx(xsk.txRing.Consumer))
+		s.Transmitted = xsk.statTransmitted.update(ldIdx(xsk.txRing.Consumer))
 	}
 	if xsk.completionRing.Consumer != nil {
-		s.Completed = uint64(ldIdx(xsk.completionRing.Consumer))
+		s.Completed = xsk.statCompleted.update(ldIdx(xsk.completionRing.Consumer))
 	}
+	xsk.statsMu.Unlock()
 	size := uint64(unsafe.Sizeof(s.KernelStats))
 	if rc, _, errno := unix.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_STATISTICS,
@@ -619,15 +653,18 @@ func (xsk *Socket) Close() error {
 			firstErr = fmt.Errorf("afxdp: close socket: %w", err)
 		}
 		xsk.fd = -1
-		for _, p := range []*[]Desc{&xsk.txRing.Descs, &xsk.rxRing.Descs} {
-			sh := (*reflect.SliceHeader)(unsafe.Pointer(p))
-			sh.Data, sh.Len, sh.Cap = 0, 0, 0
-		}
-		for _, p := range []*[]uint64{&xsk.fillRing.Descs, &xsk.completionRing.Descs} {
-			sh := (*reflect.SliceHeader)(unsafe.Pointer(p))
-			sh.Data, sh.Len, sh.Cap = 0, 0, 0
+	}
+	// Drop every alias into the ring mappings before unmapping them.
+	xsk.fillRing = umemRing{}
+	xsk.completionRing = umemRing{}
+	xsk.rxRing = rxTxRing{}
+	xsk.txRing = rxTxRing{}
+	for _, mem := range xsk.ringMems {
+		if err := syscall.Munmap(mem); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("afxdp: munmap ring: %w", err)
 		}
 	}
+	xsk.ringMems = nil
 	if xsk.umem != nil {
 		if err := syscall.Munmap(xsk.umem); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("afxdp: munmap UMEM: %w", err)

@@ -86,6 +86,7 @@ func main() {
 	// Native XDP attach resets the NIC; on ixgbe and similar the 10G link then
 	// renegotiates for several seconds, during which nothing can transmit. Wait
 	// for it to come back up so -duration is time spent actually blasting.
+	log.Printf("waiting for the link to come up (native XDP attach bounces it, ~10s on some NICs)...")
 	if fleet.WaitLinkUp(15 * time.Second) {
 		log.Printf("link up; blasting for %s", *duration)
 	} else {
