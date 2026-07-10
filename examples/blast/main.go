@@ -22,6 +22,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"flag"
 	"log"
@@ -36,6 +37,7 @@ import (
 
 	"github.com/atoonk/go-afxdp"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/time/rate"
 )
 
 func main() {
@@ -47,6 +49,8 @@ func main() {
 	size := flag.Int("size", 64, "total frame size in bytes (>=42)")
 	vlan := flag.Int("vlan", 0, "802.1Q VLAN ID to tag frames with (0 = untagged)")
 	queues := flag.Int("queues", 0, "tx queues to use (0 = all)")
+	rate := flag.Int("rate", 0, "target transmit rate in packets/sec, spread across all queues (0 = as fast as possible)")
+	chunkFlag := flag.Int("chunk", 0, "packets reserved per pacing wait, per queue (0 = auto ~500µs); smaller = smoother/less bursty, larger = burstier")
 	duration := flag.Duration("duration", 10*time.Second, "how long to blast (0 = until Ctrl-C)")
 	flag.Parse()
 
@@ -69,8 +73,12 @@ func main() {
 	if *vlan > 0 {
 		vlanNote = " " + "vlan " + strconv.Itoa(*vlan)
 	}
-	log.Printf("blasting %s:%d  (%s %s -> %s %s, %d-byte frames%s)",
-		*dstIP, *dstPort, srcIP, srcMAC, dstMAC, dip, *size, vlanNote)
+	rateNote := ""
+	if *rate > 0 {
+		rateNote = ", paced to " + strconv.Itoa(*rate) + " pps"
+	}
+	log.Printf("blasting %s:%d  (%s %s -> %s %s, %d-byte frames%s%s)",
+		*dstIP, *dstPort, srcIP, srcMAC, dstMAC, dip, *size, vlanNote, rateNote)
 
 	// Attach a no-op program (MatchNone) so we get the zero-copy TX datapath
 	// without stealing any receive traffic, and bind one socket per queue.
@@ -102,12 +110,28 @@ func main() {
 	var stop atomic.Bool
 	var bytes atomic.Uint64
 	var wg sync.WaitGroup
-	for i, xsk := range fleet.Sockets() {
+	// ctx unblocks the rate limiter's WaitN the instant we shut down, so a paced
+	// blast stops promptly instead of finishing its current wait.
+	ctx, cancel := context.WithCancel(context.Background())
+	socks := fleet.Sockets()
+	// -rate is a total across all queues, split into per-queue shares. Guard the
+	// degenerate case: a rate below the queue count would hand some queues a
+	// share of 0, which blast() reads as "unpaced" — so a tiny -rate would blast
+	// at full line rate, the exact opposite of what was asked. Refuse it.
+	if *rate > 0 && *rate < len(socks) {
+		log.Fatalf("-rate %d is below the queue count %d; each queue needs at least 1 pps — raise -rate or lower -queues", *rate, len(socks))
+	}
+	rates := splitRate(*rate, len(socks))
+	for i, xsk := range socks {
+		pps := 0
+		if rates != nil {
+			pps = rates[i]
+		}
 		wg.Add(1)
-		go func(i int, xsk *afxdp.Socket) {
+		go func() {
 			defer wg.Done()
-			blast(xsk, template, srcPortOff, uint16(1024+i*64), &bytes, &stop)
-		}(i, xsk)
+			blast(ctx, xsk, template, srcPortOff, uint16(1024+i*64), pps, *chunkFlag, &bytes, &stop)
+		}()
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); report(fleet, &bytes, &stop) }()
@@ -124,31 +148,138 @@ func main() {
 		<-sig
 	}
 	stop.Store(true)
+	cancel()  // wake any goroutine blocked in the rate limiter's WaitN
 	wg.Wait() // let TX drain and the goroutines exit before detaching
 	log.Println("stopping")
 	fleet.Close()
+}
+
+// batch is how many frames blast hands the kernel per send: big enough to
+// amortize the send syscall, small enough to keep the pacer's quantum low.
+const batch = 256
+
+// pacerBurst sizes the rate limiter's token bucket, expressed as a duration of
+// credit. The bucket cap is what gives a load generator the semantics it wants:
+// when the NIC stalls for a moment, tokens accumulate only up to the cap and
+// the rest are forfeited — so recovery is a bounded catch-up, never a full
+// second of backlog dumped at once (which would overshoot the target). It must
+// also comfortably exceed one time.Sleep oversleep (Go's sub-millisecond sleeps
+// overshoot ~1ms under load); measured on the 100G pair, a ~1ms-equivalent cap
+// sagged to 84M pps against a 100M request while 10ms holds 100.0M.
+const pacerBurst = 10 * time.Millisecond
+
+// newLimiter builds a token-bucket rate limiter for pps packets/sec. The bucket
+// holds pacerBurst worth of tokens, floored at a few batches so even a low rate
+// can still admit whole batches.
+func newLimiter(pps int) *rate.Limiter {
+	burst := int(float64(pps) * pacerBurst.Seconds())
+	if burst < 4*batch {
+		burst = 4 * batch
+	}
+	return rate.NewLimiter(rate.Limit(pps), burst)
+}
+
+// chunkInterval is the wall-clock span a pacing reservation should cover. It
+// trades the two failure modes of chunked pacing against each other: too short
+// and time.Sleep's wakeup jitter becomes a large fraction of the interval, so
+// the achieved rate sags below target; too long and each reservation is drained
+// as one big line-rate microburst, which overruns shallow buffers and cloud
+// traffic shapers (measured on an AWS same-subnet path: a 4096-packet burst at
+// 4M pps lost ~13% to silent SDN shaping, a 256-packet burst ~7%, and unpaced
+// hardware-smoothed traffic 0%). ~500µs is long enough that jitter is
+// negligible and short enough to keep the burst small. It cannot make paced
+// traffic as smooth as unpaced — only the NIC pacing itself is truly gap-free —
+// but it minimizes the burst for a given accuracy.
+const chunkInterval = 500 * time.Microsecond
+
+// pacingChunk picks how many packets to reserve per WaitN for a per-queue rate
+// of pps. It is chunkInterval worth of packets, rounded to whole batches (so the
+// send loop consumes exactly what was reserved), floored at one batch and capped
+// at the token bucket (WaitN of more than the burst can never be satisfied). A
+// positive override replaces the computed value (still clamped).
+func pacingChunk(pps, override, burst int) int {
+	chunk := int(float64(pps) * chunkInterval.Seconds())
+	if override > 0 {
+		chunk = override
+	}
+	chunk = (chunk / batch) * batch
+	if chunk < batch {
+		chunk = batch
+	}
+	if chunk > burst {
+		chunk = (burst / batch) * batch
+	}
+	return chunk
 }
 
 // blast is one queue's transmit loop. It keeps the tx ring full: reap
 // completions, allocate as many frames as there is ring space, stamp each with
 // an incrementing source port, and transmit. One goroutine owns this socket's
 // transmit side, so no locking is needed.
-func blast(xsk *afxdp.Socket, template []byte, srcPortOff int, startPort uint16, bytes *atomic.Uint64, stop *atomic.Bool) {
-	const batch = 256
+//
+// A non-zero pps paces this queue to that rate with a golang.org/x/time/rate
+// limiter; pps <= 0 transmits as fast as the NIC will go. Each WaitN reserves a
+// chunk of packets (see pacingChunk), then the chunk is transmitted in
+// batch-sized SendFunc calls. Reserving a chunk rather than a single batch
+// amortizes time.Sleep's wakeup jitter over the whole chunk (reserving one
+// batch at a time let that jitter sag the achieved rate ~1%); pacingChunk keeps
+// the chunk only as large as that needs, because a larger chunk is a larger
+// line-rate microburst that policed paths drop. WaitN returns an error only
+// when ctx is cancelled (shutdown). The bucket (sized by pacerBurst) bounds
+// catch-up after a stall — surplus beyond it is forfeited, not repaid.
+//
+// NOTE: paced output is inherently bursty at the chunk granularity — the NIC
+// emits a chunk at line rate, then idles until the next reservation matures. The
+// average matches the target, but instantaneous rate does not, so a rate-policed
+// path (e.g. AWS) may drop packets that an unpaced (NIC-smoothed) run does not.
+func blast(ctx context.Context, xsk *afxdp.Socket, template []byte, srcPortOff int, startPort uint16, pps, chunkOverride int, bytes *atomic.Uint64, stop *atomic.Bool) {
 	port := startPort
-	for !stop.Load() {
-		// SendFunc fills each frame in place and handles all the ring
-		// bookkeeping (reaping completions, kicking, never stalling on a full
-		// ring). We just stamp an incrementing source port to spread the
-		// receiver's RSS.
-		n := xsk.SendFunc(batch, func(i int, frame []byte) int {
-			copy(frame, template)
-			binary.BigEndian.PutUint16(frame[srcPortOff:], port) // vary UDP source port
-			port++
-			return len(template)
-		})
-		bytes.Add(uint64(n) * uint64(len(template)))
+	// SendFunc fills each frame in place and handles all the ring bookkeeping
+	// (reaping completions, kicking, never stalling on a full ring). We just
+	// stamp an incrementing source port to spread the receiver's RSS.
+	fill := func(i int, frame []byte) int {
+		copy(frame, template)
+		binary.BigEndian.PutUint16(frame[srcPortOff:], port) // vary UDP source port
+		port++
+		return len(template)
 	}
+
+	if pps <= 0 { // unpaced: keep the ring as full as the NIC allows
+		for !stop.Load() {
+			n := xsk.SendFunc(batch, fill)
+			bytes.Add(uint64(n) * uint64(len(template)))
+		}
+		return
+	}
+
+	lim := newLimiter(pps)
+	chunk := pacingChunk(pps, chunkOverride, lim.Burst())
+	for !stop.Load() {
+		if err := lim.WaitN(ctx, chunk); err != nil {
+			return // ctx cancelled: shutting down
+		}
+		for sent := 0; sent < chunk && !stop.Load(); sent += batch {
+			n := xsk.SendFunc(batch, fill)
+			bytes.Add(uint64(n) * uint64(len(template)))
+		}
+	}
+}
+
+// splitRate divides a total pps target across n queues, giving queue 0 the
+// remainder so the shares sum exactly to total. It returns nil for total <= 0,
+// which callers treat as "unpaced". Callers must ensure total >= n so no share
+// is zero (a zero share reads as unpaced).
+func splitRate(total, n int) []int {
+	if total <= 0 {
+		return nil
+	}
+	shares := make([]int, n)
+	base := total / n
+	for i := range shares {
+		shares[i] = base
+	}
+	shares[0] += total % n
+	return shares
 }
 
 // ethWireOverhead is the on-the-wire Ethernet framing not included in a frame
