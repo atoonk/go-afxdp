@@ -351,6 +351,20 @@ func (xsk *Socket) GetFrame(d Desc) []byte {
 	return xsk.umem[d.Addr : d.Addr+uint64(d.Len)]
 }
 
+// UMEM returns the socket's entire UMEM as one slice (NumFrames*FrameSize
+// bytes; frame i occupies [i*FrameSize, (i+1)*FrameSize)). It lets an
+// application build its own frame-granular structures — e.g. a forwarding
+// dataplane whose packet-buffer pool IS the UMEM, avoiding a copy on
+// receive. The same aliasing rules as GetFrame apply, per frame: a frame's
+// bytes are yours only between receiving it (Receive) and handing it back
+// (Recycle/Fill), or between Alloc and Transmit on the transmit side.
+func (xsk *Socket) UMEM() []byte { return xsk.umem }
+
+// FrameSize returns the UMEM frame size the socket was configured with
+// (after defaulting and driver-specific adjustment, e.g. 4096 on ENA) —
+// the stride for interpreting UMEM() frame-by-frame.
+func (xsk *Socket) FrameSize() int { return xsk.options.FrameSize }
+
 func (xsk *Socket) frameBase(addr uint64) uint64 {
 	return addr - (addr % uint64(xsk.options.FrameSize))
 }
