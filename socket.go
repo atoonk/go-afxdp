@@ -828,3 +828,48 @@ func (xsk *Socket) Close() error {
 	}
 	return firstErr
 }
+
+// PollWith parks like Poll but also wakes when any of the caller's extra
+// descriptors becomes readable (a wake eventfd another goroutine signals,
+// say), all in one syscall. It keeps the two safety properties of Poll that a
+// hand-rolled poll over FD() silently loses: the socket fd is refcounted so a
+// concurrent Close cannot recycle it mid-poll, and Close's wake descriptor is
+// in the set so a closing socket never leaves the caller parked for the full
+// timeout. Like Poll, it returns immediately when the fill ring is empty (the
+// kernel cannot deliver without fill descriptors; refill and come back).
+// Reports whether it was woken by readiness rather than the timeout.
+func (xsk *Socket) PollWith(extra []int32, timeout time.Duration) (bool, error) {
+	if !xsk.incref() {
+		return false, net.ErrClosed
+	}
+	defer xsk.decref()
+	if xsk.numFilled == 0 {
+		return true, nil
+	}
+	ms := -1
+	if timeout >= 0 {
+		ms = int(timeout / time.Millisecond)
+		if ms == 0 && timeout > 0 {
+			ms = 1 // don't turn a small positive timeout into "don't block"
+		}
+	}
+	pfds := make([]unix.PollFd, 0, 2+len(extra))
+	pfds = append(pfds,
+		unix.PollFd{Fd: int32(xsk.fd), Events: unix.POLLIN},
+		unix.PollFd{Fd: int32(xsk.wakeFd), Events: unix.POLLIN})
+	for _, fd := range extra {
+		pfds = append(pfds, unix.PollFd{Fd: fd, Events: unix.POLLIN})
+	}
+	var n int
+	var err error
+	for err = unix.EINTR; err == unix.EINTR; {
+		n, err = unix.Poll(pfds, ms)
+	}
+	if err != nil {
+		return false, err
+	}
+	if pfds[1].Revents != 0 { // woken by Close
+		return false, net.ErrClosed
+	}
+	return n > 0, nil
+}
