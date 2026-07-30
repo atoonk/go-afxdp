@@ -329,6 +329,24 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		xsk.txScratch = make([]Desc, 0, opts.TxRingNumDescs)
 	}
 
+	// Split the UMEM frames into disjoint receive and transmit pools.
+	// Receive frames come first: [0, rxFrames). Transmit frames follow:
+	// [rxFrames, NumFrames).
+	rxFrames := opts.NumFrames - opts.TxFrames
+	xsk.rxPool = newFramePool(0, rxFrames, opts.FrameSize)
+	xsk.txPool = newFramePool(rxFrames, opts.TxFrames, opts.FrameSize)
+	xsk.popScratch = make([]uint64, 0, opts.FillRingNumDescs)
+
+	// Populate the fill ring BEFORE bind. Bind is what activates the driver's
+	// XSK receive queue, and a zero-copy driver starts allocating RX buffers
+	// from the fill ring the moment it activates: activated against an empty
+	// ring, mlx5 (observed on 6.8, ConnectX at 24 queues) intermittently
+	// wedges the queue in a permanent buff_alloc_err loop that no later fill
+	// recovers -- the socket looks bound and healthy but never delivers a
+	// packet. The kernel's own xdpsock sample fills before bind for the same
+	// reason.
+	xsk.Fill(opts.FillRingNumDescs)
+
 	sa := &unix.SockaddrXDP{
 		Flags:   opts.BindFlags,
 		Ifindex: uint32(ifindex),
@@ -338,14 +356,6 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		xsk.Close()
 		return nil, fmt.Errorf("afxdp: bind queue %d: %w", queueID, err)
 	}
-
-	// Split the UMEM frames into disjoint receive and transmit pools.
-	// Receive frames come first: [0, rxFrames). Transmit frames follow:
-	// [rxFrames, NumFrames).
-	rxFrames := opts.NumFrames - opts.TxFrames
-	xsk.rxPool = newFramePool(0, rxFrames, opts.FrameSize)
-	xsk.txPool = newFramePool(rxFrames, opts.TxFrames, opts.FrameSize)
-	xsk.popScratch = make([]uint64, 0, opts.FillRingNumDescs)
 
 	return xsk, nil
 }
