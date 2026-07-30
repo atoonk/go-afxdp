@@ -275,6 +275,22 @@ Open already applies it on AWS ENA (see below), so you rarely set it by hand.
 Each socket has its own UMEM of `NumFrames * FrameSize` bytes, so memory scales
 with the queue count; size `NumFrames` accordingly on many-queue NICs.
 
+### Need Wakeup
+
+By default, `go-afxdp` enables `XDP_USE_NEED_WAKEUP`, the recommended operating mode for AF_XDP. The library automatically handles queue wakeups: `Poll()` wakes the receive path when needed, and `Kick()` wakes the transmit path.
+
+Applications that implement their own wakeup logic can disable this behavior:
+
+```go
+sock, err := afxdp.NewSocket(
+    ifindex,
+    queue,
+    afxdp.WithNeedWakeup(false),
+)
+```
+
+With `XDP_USE_NEED_WAKEUP`, the kernel can park idle RX/TX queues and request an explicit wakeup through the AF_XDP ring flags, avoiding unnecessary NAPI polling while idle.
+
 ## AWS EC2 / ENA
 
 The `ena` driver (EC2, including the "network optimized" `*n`/`*gn` instances)
