@@ -35,15 +35,22 @@ func stIdx(p *uint32, v uint32) { atomic.StoreUint32(p, v) }
 // length. It is layout-compatible with unix.XDPDesc.
 type Desc unix.XDPDesc
 
+// Flags is the kernel's per-ring flag word (XDP_MMAP_OFFSETS exposes it next to
+// the producer/consumer indices). Its only defined bit is XDP_RING_NEED_WAKEUP:
+// the driver sets it to say "I have stopped polling, wake me when you have
+// refilled". Ignoring it is why a driver bound WITHOUT XDP_USE_NEED_WAKEUP
+// spins: see NeedsWakeupRx.
 type umemRing struct {
 	Producer *uint32
 	Consumer *uint32
+	Flags    *uint32
 	Descs    []uint64
 }
 
 type rxTxRing struct {
 	Producer *uint32
 	Consumer *uint32
+	Flags    *uint32
 	Descs    []Desc
 }
 
@@ -279,6 +286,7 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 	}
 	xsk.fillRing.Producer = (*uint32)(unsafe.Add(base, offsets.Fr.Producer))
 	xsk.fillRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Fr.Consumer))
+	xsk.fillRing.Flags = (*uint32)(unsafe.Add(base, offsets.Fr.Flags))
 	xsk.fillRing.Descs = unsafe.Slice((*uint64)(unsafe.Add(base, offsets.Fr.Desc)), opts.FillRingNumDescs)
 
 	// Completion ring.
@@ -290,6 +298,7 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 	}
 	xsk.completionRing.Producer = (*uint32)(unsafe.Add(base, offsets.Cr.Producer))
 	xsk.completionRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Cr.Consumer))
+	xsk.completionRing.Flags = (*uint32)(unsafe.Add(base, offsets.Cr.Flags))
 	xsk.completionRing.Descs = unsafe.Slice((*uint64)(unsafe.Add(base, offsets.Cr.Desc)), opts.CompletionRingNumDescs)
 
 	if hasRx {
@@ -301,6 +310,7 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		}
 		xsk.rxRing.Producer = (*uint32)(unsafe.Add(base, offsets.Rx.Producer))
 		xsk.rxRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Rx.Consumer))
+		xsk.rxRing.Flags = (*uint32)(unsafe.Add(base, offsets.Rx.Flags))
 		xsk.rxRing.Descs = unsafe.Slice((*Desc)(unsafe.Add(base, offsets.Rx.Desc)), opts.RxRingNumDescs)
 		xsk.rxScratch = make([]Desc, 0, opts.RxRingNumDescs)
 	}
@@ -314,6 +324,7 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		}
 		xsk.txRing.Producer = (*uint32)(unsafe.Add(base, offsets.Tx.Producer))
 		xsk.txRing.Consumer = (*uint32)(unsafe.Add(base, offsets.Tx.Consumer))
+		xsk.txRing.Flags = (*uint32)(unsafe.Add(base, offsets.Tx.Flags))
 		xsk.txRing.Descs = unsafe.Slice((*Desc)(unsafe.Add(base, offsets.Tx.Desc)), opts.TxRingNumDescs)
 		xsk.txScratch = make([]Desc, 0, opts.TxRingNumDescs)
 	}
@@ -399,11 +410,41 @@ func (xsk *Socket) Fill(n int) int {
 	return len(addrs)
 }
 
+// ringNeedsWakeup reports the XDP_RING_NEED_WAKEUP bit. A nil Flags pointer
+// means the ring was mapped by a kernel too old to expose it, in which case the
+// driver never sleeps and no wakeup is needed.
+func ringNeedsWakeup(flags *uint32) bool {
+	return flags != nil && atomic.LoadUint32(flags)&unix.XDP_RING_NEED_WAKEUP != 0
+}
+
+// NeedsWakeupRx reports whether the driver has stopped polling the receive side
+// and is waiting to be woken.
+//
+// This is the whole point of binding with XDP_USE_NEED_WAKEUP (WithNeedWakeup).
+// WITHOUT that flag, a driver that cannot get buffers from the fill ring has no
+// way to say so: ixgbe_clean_rx_irq_zc returns `budget` instead of the real
+// packet count, so napi_complete is never called, NAPI reschedules itself
+// immediately, and ksoftirqd spins in net_rx_action forever — on this hardware
+// that burned 65% of a 12-core box at ZERO packets per second, with every poll
+// reporting work==budget. WITH the flag the driver returns the true count, NAPI
+// completes and sleeps, and it is our job to wake it after refilling. Poll does
+// that automatically; call this directly only if you drive the rings yourself.
+func (xsk *Socket) NeedsWakeupRx() bool { return ringNeedsWakeup(xsk.fillRing.Flags) }
+
+// NeedsWakeupTx reports whether the driver has stopped polling the transmit
+// side and needs a Kick to resume. Only meaningful with WithNeedWakeup.
+func (xsk *Socket) NeedsWakeupTx() bool { return ringNeedsWakeup(xsk.txRing.Flags) }
+
 // Poll blocks until the kernel has received frames, the timeout elapses, or
 // the Socket is closed. A negative timeout waits forever; zero returns
 // immediately. It returns the number of received frames now available to
 // Receive. Poll only watches the receive direction; the transmit side drives
 // completions via Complete/Kick.
+//
+// Poll doubles as the RX wakeup: when the driver has parked itself (see
+// NeedsWakeupRx) the poll(2) call is what restarts its NAPI poll, so a receive
+// loop that calls Poll whenever it finds no packets needs no other change to
+// work correctly with WithNeedWakeup.
 //
 // Close from another goroutine wakes a blocked Poll, which then returns
 // net.ErrClosed — so a receive loop that stops on any Poll error shuts down
@@ -413,7 +454,10 @@ func (xsk *Socket) Poll(timeout time.Duration) (numReceived int, err error) {
 		return 0, net.ErrClosed
 	}
 	defer xsk.decref()
-	if xsk.numFilled == 0 {
+	// Nothing in the fill ring means the kernel has nowhere to put a packet, so
+	// blocking would be pointless — EXCEPT when the driver is parked waiting on
+	// us, where the poll(2) below is the only thing that will restart it.
+	if xsk.numFilled == 0 && !xsk.NeedsWakeupRx() {
 		return 0, nil
 	}
 	ms := -1

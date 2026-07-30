@@ -161,7 +161,11 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 		}
 		for _, bindFlags := range g.bindFlags {
 			opts := base
-			opts.BindFlags = bindFlags
+			// The mode group decides zero-copy vs copy; OR rather than assign so
+			// caller flags that are orthogonal to the mode survive. Assigning here
+			// silently dropped WithNeedWakeup, which is invisible at bind time (the
+			// kernel accepts either) and only shows up as the driver spinning.
+			opts.BindFlags = bindFlags | base.BindFlags
 			opts.XDPFlags = g.xdpFlags
 			socks, err := registerSockets(prog, ifindex, nQueues, &opts)
 			if err != nil {
