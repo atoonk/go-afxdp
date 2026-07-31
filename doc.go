@@ -70,7 +70,8 @@ you — reclaiming sent frames, kicking the kernel, and never stalling on a full
 ring — so you just call it in a loop:
 
 	for {
-		xsk.SendBatch(packets) // copies and transmits; returns the count queued
+		n, err := xsk.SendBatch(packets) // copies and transmits; returns the count queued
+		...
 	}
 
 SendFunc avoids the copy and fills each frame in place (for a generator that

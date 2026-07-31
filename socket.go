@@ -114,6 +114,11 @@ type Socket struct {
 	txPopScratch   []uint64
 	numTransmitted int
 
+	// Kick accounting: written on the transmit path, read by Stats from its
+	// own goroutine, hence atomic rather than guarded by statsMu.
+	statKicks           atomic.Uint64
+	statKicksSuppressed atomic.Uint64
+
 	// Stats-side state: the kernel's ring indices are 32-bit and wrap every
 	// 2^32 packets (~5 minutes at 10G line rate), so Stats extends them to
 	// 64-bit here. Guarded by statsMu — only the Stats path takes it, the
@@ -615,16 +620,31 @@ func (xsk *Socket) Transmit(descs []Desc) int {
 	}
 	stIdx(xsk.txRing.Producer, prod) // release: descriptors written above are now visible
 	xsk.numTransmitted += len(descs)
-	_ = xsk.Kick()
+	if xsk.kickNeeded() {
+		_ = xsk.Kick()
+	} else {
+		xsk.statKicksSuppressed.Add(1)
+	}
 	return len(descs)
 }
 
+// kickNeeded reports whether transmitting requires a kick syscall right now.
+// Without XDP_USE_NEED_WAKEUP the kernel never advertises its state, so every
+// transmit must kick. With it, the tx ring flag says whether the driver has
+// parked: a zero-copy driver actively draining the ring clears the flag and
+// needs no syscall at all, which is where need-wakeup pays for itself (copy
+// mode keeps the flag set essentially always, so it still kicks every time).
+func (xsk *Socket) kickNeeded() bool {
+	return xsk.options.BindFlags&unix.XDP_USE_NEED_WAKEUP == 0 || xsk.NeedsWakeupTx()
+}
+
 // Kick asks the kernel to process the tx ring. Transmit calls it for you after
-// queueing frames, so you normally don't call it directly — with one important
-// exception: if the tx ring fills up (NumFreeTxSlots returns 0) so you can't
-// Transmit more, call Kick anyway to keep the kernel draining the ring and
-// producing completions. In copy mode the kernel will not drain the ring
-// without a kick, so a tight "if full, continue" loop that skips the kick
+// queueing frames (skipping the syscall when a need-wakeup bind shows the
+// driver already awake), so you normally don't call it directly — with one
+// important exception: if the tx ring fills up (NumFreeTxSlots returns 0) so
+// you can't Transmit more, call Kick anyway to keep the kernel draining the
+// ring and producing completions. In copy mode the kernel will not drain the
+// ring without a kick, so a tight "if full, continue" loop that skips the kick
 // deadlocks. (In zero-copy the driver drains on its own, but kicking is
 // harmless.)
 func (xsk *Socket) Kick() error {
@@ -632,7 +652,20 @@ func (xsk *Socket) Kick() error {
 		return net.ErrClosed
 	}
 	defer xsk.decref()
+	// Copy-mode transmit processes only a bounded batch of descriptors per
+	// syscall (TX_BATCH_SIZE in net/xdp/xsk.c, 16 or 32 depending on kernel
+	// version) and returns EAGAIN while the tx ring still holds more, so a
+	// single kick is not guaranteed to drain a large batch — retry until the
+	// kernel stops asking. The retry budget covers a full tx ring at the
+	// smallest batch size; it exists because EAGAIN can also mean a condition
+	// a kick cannot clear (a busy device queue, or on some kernel versions a
+	// full completion ring that only Complete relieves), where retrying
+	// forever would wedge the transmit goroutine. (Watching the ring's
+	// consumer index instead does not work: the kernel publishes it lazily, a
+	// syscall behind its actual progress.)
+	retries := xsk.options.TxRingNumDescs/16 + 8
 	for {
+		xsk.statKicks.Add(1)
 		rc, _, errno := unix.Syscall6(unix.SYS_SENDTO, uintptr(xsk.fd),
 			0, 0, uintptr(unix.MSG_DONTWAIT), 0, 0)
 		if rc == 0 {
@@ -641,9 +674,13 @@ func (xsk *Socket) Kick() error {
 		switch errno {
 		case unix.EINTR:
 			continue
-		case unix.EAGAIN, unix.EBUSY:
-			// EAGAIN: kernel busy, will pick up the ring later.
-			// EBUSY: completed but not yet sent. Both are non-fatal.
+		case unix.EAGAIN:
+			if retries--; retries > 0 {
+				continue
+			}
+			return nil
+		case unix.EBUSY:
+			// Completed but not yet sent; non-fatal.
 			return nil
 		default:
 			return fmt.Errorf("afxdp: sendto kick: %w", errno)
@@ -721,7 +758,17 @@ func (xsk *Socket) FreeTxFrames() int { return xsk.txPool.len() }
 // fewer than len(payloads) (possibly zero) when the ring is momentarily full;
 // queue the rest on a later call. Like the rest of the transmit side it is for
 // a single transmit goroutine (or guard it with your own mutex).
-func (xsk *Socket) SendBatch(payloads [][]byte) int {
+//
+// A payload longer than FrameSize cannot fit in a UMEM frame; SendBatch
+// rejects the whole batch up front with an error rather than truncating it on
+// the wire, and queues nothing.
+func (xsk *Socket) SendBatch(payloads [][]byte) (int, error) {
+	for i, p := range payloads {
+		if len(p) > xsk.options.FrameSize {
+			return 0, fmt.Errorf("afxdp: SendBatch payload %d is %d bytes, larger than FrameSize %d",
+				i, len(p), xsk.options.FrameSize)
+		}
+	}
 	return xsk.SendFunc(len(payloads), func(i int, frame []byte) int {
 		return copy(frame, payloads[i])
 	})
@@ -732,9 +779,13 @@ func (xsk *Socket) SendBatch(payloads [][]byte) int {
 // and returns the packet length). Use it when you want to construct packets
 // directly in the UMEM or vary a field per packet (e.g. a packet generator). It
 // handles the same ring bookkeeping as SendBatch and returns the number queued.
-func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) int {
+//
+// build must return a length in [0, len(frame)]. Anything else is reported as
+// an error and the whole batch is abandoned unqueued — the length would have
+// described bytes that were never written to the frame.
+func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) (int, error) {
 	if !xsk.incref() {
-		return 0
+		return 0, net.ErrClosed
 	}
 	defer xsk.decref()
 	xsk.Complete(xsk.NumCompleted()) // reclaim already-sent frames
@@ -742,17 +793,32 @@ func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) int 
 	if free == 0 {
 		// Ring full: kick so the kernel drains it (in copy mode it won't on its
 		// own) and produces completions for the next call to reclaim.
-		_ = xsk.Kick()
-		return 0
+		if xsk.kickNeeded() {
+			_ = xsk.Kick()
+		} else {
+			xsk.statKicksSuppressed.Add(1)
+		}
+		return 0, nil
 	}
 	if count > free {
 		count = free
 	}
 	descs := xsk.Alloc(count) // never more than free ring slots, so all transmit
 	for i := range descs {
-		descs[i].Len = uint32(build(i, xsk.GetFrame(descs[i])))
+		frame := xsk.GetFrame(descs[i])
+		n := build(i, frame)
+		if n < 0 || n > len(frame) {
+			// Nothing has been queued yet, so hand every allocated frame back
+			// to the transmit pool before reporting the bad length.
+			for _, d := range descs {
+				xsk.txPool.push(xsk.frameBase(d.Addr))
+			}
+			return 0, fmt.Errorf("afxdp: SendFunc build returned length %d for packet %d, valid range is [0, %d]",
+				n, i, len(frame))
+		}
+		descs[i].Len = uint32(n)
 	}
-	return xsk.Transmit(descs)
+	return xsk.Transmit(descs), nil
 }
 
 // Stats holds cumulative counters for a Socket. KernelStats carries the
@@ -763,7 +829,9 @@ type Stats struct {
 	Transmitted uint64 // frames sent (consumed by the kernel from the tx ring)
 	Completed   uint64 // completions reaped via Complete; trails Transmitted if
 	// you reap lazily, so prefer Transmitted for a "packets sent" count.
-	KernelStats unix.XDPStatistics
+	Kicks           uint64 // tx kick syscalls issued (sendto), including drain retries
+	KicksSuppressed uint64 // Transmit kicks skipped because need-wakeup showed the driver awake
+	KernelStats     unix.XDPStatistics
 }
 
 // String renders Stats as a single human-readable line.
@@ -806,6 +874,8 @@ func (xsk *Socket) Stats() (Stats, error) {
 		s.Completed = xsk.statCompleted.update(ldIdx(xsk.completionRing.Consumer))
 	}
 	xsk.statsMu.Unlock()
+	s.Kicks = xsk.statKicks.Load()
+	s.KicksSuppressed = xsk.statKicksSuppressed.Load()
 	size := uint64(unsafe.Sizeof(s.KernelStats))
 	if rc, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_STATISTICS,
@@ -890,14 +960,18 @@ func (xsk *Socket) Close() error {
 // concurrent Close cannot recycle it mid-poll, and Close's wake descriptor is
 // in the set so a closing socket never leaves the caller parked for the full
 // timeout. Like Poll, it returns immediately when the fill ring is empty (the
-// kernel cannot deliver without fill descriptors; refill and come back).
+// kernel cannot deliver without fill descriptors; refill and come back),
+// except when the driver is parked awaiting an RX wakeup.
 // Reports whether it was woken by readiness rather than the timeout.
 func (xsk *Socket) PollWith(extra []int32, timeout time.Duration) (bool, error) {
 	if !xsk.incref() {
 		return false, net.ErrClosed
 	}
 	defer xsk.decref()
-	if xsk.numFilled == 0 {
+	// Same early-out as Poll: an empty fill ring means blocking is pointless —
+	// unless the driver is parked waiting on us, where the poll(2) below is the
+	// only thing that will restart it.
+	if xsk.numFilled == 0 && !xsk.NeedsWakeupRx() {
 		return true, nil
 	}
 	ms := -1

@@ -141,12 +141,15 @@ func blast(xsk *afxdp.Socket, template []byte, srcPortOff int, startPort uint16,
 		// bookkeeping (reaping completions, kicking, never stalling on a full
 		// ring). We just stamp an incrementing source port to spread the
 		// receiver's RSS.
-		n := xsk.SendFunc(batch, func(i int, frame []byte) int {
+		n, err := xsk.SendFunc(batch, func(i int, frame []byte) int {
 			copy(frame, template)
 			binary.BigEndian.PutUint16(frame[srcPortOff:], port) // vary UDP source port
 			port++
 			return len(template)
 		})
+		if err != nil {
+			log.Fatalf("SendFunc: %v", err)
+		}
 		bytes.Add(uint64(n) * uint64(len(template)))
 	}
 }
