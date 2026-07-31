@@ -22,7 +22,7 @@ import "golang.org/x/sys/unix"
 // never touch the same frames (see the package doc).
 type Options struct {
 	// NumFrames is the total number of buffers in the UMEM (rx + tx).
-	// Must be > 0. Default 4096.
+	// Must be > 0. Default 8192.
 	NumFrames int
 
 	// FrameSize is the size in bytes of each UMEM buffer. Default 2048.
@@ -40,7 +40,7 @@ type Options struct {
 	// or higher for a transmit-heavy generator.
 	TxFrames int
 
-	// Ring sizes. Each must be a power of two. Defaults: 2048 for every ring.
+	// Ring sizes. Each must be a power of two. Defaults: 4096 for every ring.
 	// FillRingNumDescs and RxRingNumDescs are the receive rings;
 	// TxRingNumDescs and CompletionRingNumDescs are the transmit rings.
 	// A ring set to zero disables that direction (you cannot disable both rx
@@ -162,7 +162,7 @@ func newConfig(opts ...Option) config {
 	// Start from a zero Options and let withDefaults (called by Open) fill any
 	// field left unset. Crucially this means defaults are derived from the
 	// final values — e.g. WithNumFrames(256) yields TxFrames=128, not the
-	// fixed default of 2048 that would exceed it.
+	// fixed default of 4096 that would exceed it.
 	var c config
 	for _, o := range opts {
 		o(&c)
@@ -197,7 +197,7 @@ func WithUDPPorts(ports ...uint16) Option {
 	return func(c *config) { c.matches = append(c.matches, MatchUDPPort(ports...)) }
 }
 
-// WithNumFrames sets the total number of UMEM buffers (rx + tx). Default 4096.
+// WithNumFrames sets the total number of UMEM buffers (rx + tx). Default 8192.
 func WithNumFrames(n int) Option { return func(c *config) { c.opts.NumFrames = n } }
 
 // WithFrameSize sets the size of each UMEM buffer in bytes. Default 2048; use

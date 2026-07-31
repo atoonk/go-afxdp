@@ -77,7 +77,8 @@ Just call it in a loop.
 fleet, _ := afxdp.Open("eth0", afxdp.WithFilter(afxdp.MatchNone())) // transmit only
 xsk := fleet.Sockets()[0]
 for {
-    xsk.SendBatch(packets) // returns how many were queued this call
+    n, err := xsk.SendBatch(packets) // returns how many were queued this call
+    ...
 }
 ```
 
@@ -220,13 +221,16 @@ handle all the ring bookkeeping, so you just call them in a loop.
 ```go
 // SendFunc fills each frame in place and returns the packet length.
 for {
-    xsk.SendFunc(256, func(i int, frame []byte) int {
+    _, err := xsk.SendFunc(256, func(i int, frame []byte) int {
         n := copy(frame, template)
         // offset 34 is the UDP source port (eth 14 + ip 20); vary it per packet
         binary.BigEndian.PutUint16(frame[34:], srcPort)
         srcPort++
         return n
     })
+    if err != nil {
+        log.Fatal(err) // a payload/length larger than FrameSize is a bug, not a retry
+    }
 }
 ```
 
@@ -277,19 +281,31 @@ with the queue count; size `NumFrames` accordingly on many-queue NICs.
 
 ### Need Wakeup
 
-By default, `go-afxdp` enables `XDP_USE_NEED_WAKEUP`, the recommended operating mode for AF_XDP. The library automatically handles queue wakeups: `Poll()` wakes the receive path when needed, and `Kick()` wakes the transmit path.
-
-Applications that implement their own wakeup logic can disable this behavior:
+`WithNeedWakeup()` binds with `XDP_USE_NEED_WAKEUP`, the recommended operating
+mode for AF_XDP:
 
 ```go
-sock, err := afxdp.NewSocket(
-    ifindex,
-    queue,
-    afxdp.WithNeedWakeup(false),
+fleet, err := afxdp.Open("eth0",
+    afxdp.WithUDPPorts(4789),
+    afxdp.WithNeedWakeup(),
 )
 ```
 
-With `XDP_USE_NEED_WAKEUP`, the kernel can park idle RX/TX queues and request an explicit wakeup through the AF_XDP ring flags, avoiding unnecessary NAPI polling while idle.
+With the flag set, the kernel parks idle RX/TX queues and asks for an explicit
+wakeup through the AF_XDP ring flags instead of NAPI-polling in a loop (without
+it, a buffer-starved driver can burn entire cores in ksoftirqd while forwarding
+nothing — see the `WithNeedWakeup` doc comment for the gory details). The
+library handles the waking for you: `Poll` wakes the receive path, and the
+transmit path kicks the kernel as needed.
+
+It also cuts transmit syscalls: when the ring flags show the driver awake and
+draining (typical in zero-copy mode), `Transmit` skips the `sendto` kick
+entirely. `Stats().Kicks` and `Stats().KicksSuppressed` show how often each
+happens.
+
+It is not the default only because it changes the kernel contract for
+applications that drive the rings themselves rather than through `Poll`/`Kick`.
+If you use the high-level API, turn it on.
 
 ## AWS EC2 / ENA
 
