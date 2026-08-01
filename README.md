@@ -134,6 +134,77 @@ app-protocol stack, stateful deep packet inspection, traffic generation, or
 anything that needs real Go libraries. The sweet spot is to let XDP cheaply pass
 the bulk to the kernel and lift only the flows you care about up to Go.
 
+## Performance
+
+Two bare-metal boxes, AMD EPYC 9275F (24 cores / 48 threads), 100 Gbit/s Mellanox
+ConnectX (`mlx5_core`) with 48 combined queues, native XDP and zero-copy on both
+ends. [`examples/blast`](examples/blast) on one, [`examples/drop`](examples/drop)
+on the other, over a tagged VLAN.
+
+| frame size | sent | received | TX cores | RX cores |
+| --- | --- | --- | --- | --- |
+| 1500 B | 8.20 Mpps, 99.9 Gbit/s | 8.18 Mpps, 99.7 Gbit/s, no drops | 18 | 17 |
+| 64 B | 140 Mpps, 98.5 Gbit/s | 119 Mpps, 83.6 Gbit/s | 23 | 21 |
+
+With 1500-byte frames this fills a 100G link in both directions and loses nothing.
+
+With 64-byte frames the sender reaches about 98% of line rate. The receiver takes
+119 Mpps of it and the missing 21 Mpps never reach the rings: the receiving NIC
+discards them itself (`rx_discards_phy`) because it cannot DMA into host memory
+that fast. The wire delivered 100.00% of what was sent, our fill ring ran dry
+7,033 times out of 3.5 billion packets, and nothing was dropped at the application
+level — so that ceiling is the card's, not this library's.
+
+Cores are userspace CPU of the example process on a 48-thread box; driver and
+softirq work sits on top (the machines ran 80–99% busy at these rates). Packet
+generation is included in the TX figure and is a small part of it: a variant of
+`blast` with the frames pre-built uses 22.0 cores instead of 22.8, so building
+each packet costs roughly 3% of the send path.
+
+### Scaling per queue
+
+One socket and one goroutine per queue, so queue count is roughly core count.
+Setting the NIC to N queues on both ends with `ethtool -L eno2 combined N`
+(reset the RSS table first with `ethtool -X eno2 equal N`, or the change is
+refused), 64-byte frames:
+
+| queues | sent | TX cores | received | RX cores | pkt/poll |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 13.6 Mpps | 1.0 | 7.7 Mpps | 0.5 | 64 |
+| 2 | 26.2 Mpps | 2.0 | 15.3 Mpps | 0.7 | 64 |
+| 4 | 51.5 Mpps | 4.0 | 34.0 Mpps | 1.6 | 64 |
+| 8 | 95.2 Mpps | 8.0 | 73.6 Mpps | 2.3 | 64 |
+| 16 | 141.3 Mpps | 16.0 | 116.9 Mpps | 4.0 | 64 |
+| 24 | 138.4 Mpps | 22.9 | 115.2 Mpps | 9.2 | 56 |
+| 32 | 139.5 Mpps | 22.4 | 118.4 Mpps | 13.7 | 53 |
+| 48 | 138.9 Mpps | 22.7 | 118.8 Mpps | 21.4 | 39 |
+
+Transmit scales linearly at about **13.6 Mpps per core** and reaches line rate at
+16 queues. Receive costs far less userspace CPU because the expensive half — the
+driver's NAPI poll and the XDP redirect — runs in softirq, not in the process;
+a single queue tops out near 7.7 Mpps while our loop consumes it with half a core.
+
+**More queues is not better.** Past 16 nothing gets faster, but everything gets
+more expensive: batches thin out (64 packets per `poll(2)` down to 39, visible as
+`Stats.PacketsPerPoll`), so the same traffic costs more syscalls and more CPU.
+Measured box-wide on the receiver, 16 queues carried 116 Mpps using 19.5 of 48
+cores, while 48 queues carried 119 Mpps using 36.5 — nearly double the machine for
+2% more throughput.
+
+Tune this on the NIC, not in the application. Reduce the channel count so RSS only
+spreads over the queues you want, and keep binding all of them (the default):
+
+```
+ethtool -X eno2 equal 16      # shrink the RSS table first
+ethtool -L eno2 combined 16   # then the channels
+```
+
+Using `WithQueues(16)` while the NIC still has 48 RSS queues does something quite
+different and usually wrong: the flows hashed to the other 32 queues have no socket
+bound, so the XDP program passes them to the kernel and your application never sees
+them. You cannot choose which queue a flow lands on, which is why binding every
+available queue is the default.
+
 ## Filtering
 
 A filter decides which packets are handed to your sockets. Only matching packets
