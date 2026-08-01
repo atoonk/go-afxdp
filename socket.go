@@ -1016,6 +1016,7 @@ func (xsk *Socket) PollWith(extra []int32, timeout time.Duration) (bool, error) 
 	}
 	var n int
 	var err error
+	xsk.statPolls.Add(1)
 	for err = unix.EINTR; err == unix.EINTR; {
 		n, err = unix.Poll(pfds, ms)
 	}

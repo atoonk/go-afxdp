@@ -200,6 +200,57 @@ func TestVethEndToEnd(t *testing.T) {
 	}
 }
 
+// TestPollWithCountsPolls is the regression test for a counter that only
+// instrumented Poll: a consumer that waits through PollWith (because it needs
+// to watch extra fds alongside the xsk) reported Polls=0 forever, so
+// PacketsPerPoll read as "never blocked" on exactly the multi-queue shape
+// where receive batching matters most.
+func TestPollWithCountsPolls(t *testing.T) {
+	ifA, ifB := newVethPair(t)
+	_, rx := openVethFleets(t, ifA, ifB)
+	xsk := rx.Sockets()[0]
+
+	// Fill so PollWith actually blocks rather than taking its empty-fill-ring
+	// early-out (which correctly makes no syscall and must not be counted).
+	xsk.Fill(xsk.NumFreeFillSlots())
+
+	before, err := xsk.Stats()
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := xsk.PollWith(nil, 50*time.Millisecond); err != nil {
+			t.Fatalf("PollWith: %v", err)
+		}
+	}
+	after, err := xsk.Stats()
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if got := after.Polls - before.Polls; got != 3 {
+		t.Errorf("PollWith made 3 blocking waits but Polls moved by %d, want 3", got)
+	}
+}
+
+// TestPollEarlyOutNotCounted checks the other half of the contract: with an
+// empty fill ring and an awake driver, both Poll and PollWith return without
+// making a syscall, so neither may bump the counter. Runs against a bare
+// Socket because a bound one has its fill ring populated before bind, and
+// draining it just to reach this path would prove less.
+func TestPollEarlyOutNotCounted(t *testing.T) {
+	xsk := &Socket{fd: -1, wakeFd: -1} // numFilled 0, nil ring flags = driver awake
+
+	if n, err := xsk.Poll(10 * time.Millisecond); n != 0 || err != nil {
+		t.Fatalf("Poll early-out returned (%d, %v), want (0, nil)", n, err)
+	}
+	if ready, err := xsk.PollWith(nil, 10*time.Millisecond); !ready || err != nil {
+		t.Fatalf("PollWith early-out returned (%v, %v), want (true, nil)", ready, err)
+	}
+	if got := xsk.statPolls.Load(); got != 0 {
+		t.Errorf("Polls = %d after two no-syscall early-outs, want 0", got)
+	}
+}
+
 // TestPacketsPerPoll covers the derived ratio without needing a socket.
 func TestPacketsPerPoll(t *testing.T) {
 	if got := (Stats{Received: 100, Polls: 0}).PacketsPerPoll(); got != 0 {
