@@ -119,6 +119,9 @@ type Socket struct {
 	statKicks           atomic.Uint64
 	statKicksSuppressed atomic.Uint64
 
+	// Receive-path syscall accounting, same rationale as the kick counters.
+	statPolls atomic.Uint64
+
 	// Stats-side state: the kernel's ring indices are 32-bit and wrap every
 	// 2^32 packets (~5 minutes at 10G line rate), so Stats extends them to
 	// 64-bit here. Guarded by statsMu — only the Stats path takes it, the
@@ -486,6 +489,7 @@ func (xsk *Socket) Poll(timeout time.Duration) (numReceived int, err error) {
 		{Fd: int32(xsk.fd), Events: unix.POLLIN},
 		{Fd: int32(xsk.wakeFd), Events: unix.POLLIN},
 	}
+	xsk.statPolls.Add(1)
 	for err = unix.EINTR; err == unix.EINTR; {
 		_, err = unix.Poll(pfds[:], ms)
 	}
@@ -831,12 +835,33 @@ type Stats struct {
 	// you reap lazily, so prefer Transmitted for a "packets sent" count.
 	Kicks           uint64 // tx kick syscalls issued (sendto), including drain retries
 	KicksSuppressed uint64 // Transmit kicks skipped because need-wakeup showed the driver awake
-	KernelStats     unix.XDPStatistics
+	// Polls counts rx poll(2) syscalls — one per Poll call that actually
+	// blocks. Divided by Received it gives packets per syscall, i.e. how well
+	// your receive loop is batching: a healthy loaded queue reads in the
+	// dozens or hundreds, while a value near 1 means you are paying a syscall
+	// per packet and should drain more per wakeup.
+	Polls       uint64
+	KernelStats unix.XDPStatistics
+}
+
+// PacketsPerPoll returns how many frames were received per blocking poll(2) on
+// average — the receive loop's batching efficiency. Higher is better: each
+// syscall is amortized over that many packets. A value near 1 means a syscall
+// per packet, usually because the loop drains less than what is waiting. It
+// returns 0 before the first poll.
+func (s Stats) PacketsPerPoll() float64 {
+	if s.Polls == 0 {
+		return 0
+	}
+	return float64(s.Received) / float64(s.Polls)
 }
 
 // String renders Stats as a single human-readable line.
 func (s Stats) String() string {
 	out := fmt.Sprintf("rx=%d tx=%d packets", s.Received, s.Transmitted)
+	if s.Polls > 0 {
+		out += fmt.Sprintf(", %.0f pkt/poll", s.PacketsPerPoll())
+	}
 	if drops := s.KernelStats.Rx_dropped + s.KernelStats.Rx_ring_full; drops > 0 {
 		out += fmt.Sprintf(", rx_drops=%d", drops)
 	}
@@ -876,6 +901,7 @@ func (xsk *Socket) Stats() (Stats, error) {
 	xsk.statsMu.Unlock()
 	s.Kicks = xsk.statKicks.Load()
 	s.KicksSuppressed = xsk.statKicksSuppressed.Load()
+	s.Polls = xsk.statPolls.Load()
 	size := uint64(unsafe.Sizeof(s.KernelStats))
 	if rc, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_STATISTICS,

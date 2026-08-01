@@ -184,6 +184,30 @@ func TestVethEndToEnd(t *testing.T) {
 	if stats.KicksSuppressed != 0 {
 		t.Errorf("KicksSuppressed = %d: copy mode keeps need-wakeup set, nothing should be suppressed", stats.KicksSuppressed)
 	}
+
+	// The receiver blocked in Poll for every batch, so its poll counter must
+	// have moved and the derived packets-per-poll must be sane.
+	rxStats, err := rxSock.Stats()
+	if err != nil {
+		t.Fatalf("rx stats: %v", err)
+	}
+	if rxStats.Polls == 0 {
+		t.Error("Polls = 0 on a receiver that blocked in Poll")
+	}
+	if pp := rxStats.PacketsPerPoll(); pp <= 0 {
+		t.Errorf("PacketsPerPoll() = %v, want > 0 with %d packets over %d polls",
+			pp, rxStats.Received, rxStats.Polls)
+	}
+}
+
+// TestPacketsPerPoll covers the derived ratio without needing a socket.
+func TestPacketsPerPoll(t *testing.T) {
+	if got := (Stats{Received: 100, Polls: 0}).PacketsPerPoll(); got != 0 {
+		t.Errorf("PacketsPerPoll() = %v with no polls yet, want 0", got)
+	}
+	if got := (Stats{Received: 1000, Polls: 10}).PacketsPerPoll(); got != 100 {
+		t.Errorf("PacketsPerPoll() = %v, want 100", got)
+	}
 }
 
 // TestSendValidation covers the SendBatch/SendFunc error paths: oversized

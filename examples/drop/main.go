@@ -128,7 +128,7 @@ func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, iface string) {
 	socks := fleet.Sockets()
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	var lastP, lastB, lastRingFull uint64
+	var lastP, lastB, lastRingFull, lastPolls uint64
 	// rx_missed comes from the netdev stats, which ixgbe (and similar drivers)
 	// refresh only every ~2s — so a 1-second delta sawtooths between 0 and two
 	// seconds' worth. Keep two ticks of history and report the delta over that
@@ -138,7 +138,7 @@ func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, iface string) {
 	for range t.C {
 		// One pass over the sockets: total rx, total rx-ring-full drops, and the
 		// per-queue rx-ring-full so we can point at the hot queue.
-		var rxPkts, ringFull uint64
+		var rxPkts, ringFull, polls uint64
 		perQ := make([]uint64, len(socks))
 		for i, xsk := range socks {
 			st, err := xsk.Stats()
@@ -148,6 +148,7 @@ func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, iface string) {
 			rxPkts += st.Received
 			ringFull += st.KernelStats.Rx_ring_full
 			perQ[i] = st.KernelStats.Rx_ring_full
+			polls += st.Polls
 		}
 
 		b := bytes.Load()
@@ -170,10 +171,17 @@ func report(fleet *afxdp.Fleet, bytes *atomic.Uint64, iface string) {
 		nicDrops := (missed - missedHist[0]) / 2 // delta over the last ~2s, per second
 		missedHist[0], missedHist[1] = missedHist[1], missed
 
-		log.Printf("%d rx pps  %.2f Gbit/s   drops: nic=%d/s app=%d/s%s",
-			pps, gbits, nicDrops, ringFull-lastRingFull, perQueue)
+		// Stats.Polls counts blocking poll(2) calls. Per second it is the
+		// syscall cost of the receive loop; divided into the packet rate it is
+		// how many packets each syscall paid for (see Stats.PacketsPerPoll).
+		perPoll := 0.0
+		if dp := polls - lastPolls; dp > 0 {
+			perPoll = float64(pps) / float64(dp)
+		}
+		log.Printf("%d rx pps  %.2f Gbit/s   drops: nic=%d/s app=%d/s   %d polls/s (%.0f pkt/poll)%s",
+			pps, gbits, nicDrops, ringFull-lastRingFull, polls-lastPolls, perPoll, perQueue)
 
-		lastP, lastB, lastRingFull = rxPkts, b, ringFull
+		lastP, lastB, lastRingFull, lastPolls = rxPkts, b, ringFull, polls
 	}
 }
 
