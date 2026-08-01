@@ -229,7 +229,9 @@ for {
         return n
     })
     if err != nil {
-        log.Fatal(err) // a payload/length larger than FrameSize is a bug, not a retry
+        // A length > FrameSize is a caller bug. Don't crash (or log unbounded)
+        // inside a dataplane loop — log it rate-limited and keep going; see
+        // the errLog helper in examples/blast.
     }
 }
 ```

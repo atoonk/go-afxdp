@@ -23,6 +23,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"flag"
 	"log"
 	"net"
@@ -129,12 +130,36 @@ func main() {
 	fleet.Close()
 }
 
+// errLog logs at most one line per second, counting suppressed repeats. A
+// dataplane loop can see millions of errors per second; neither crashing the
+// process nor logging unbounded is acceptable there. One instance per
+// goroutine, so no locking is needed.
+type errLog struct {
+	last       time.Time
+	suppressed int
+}
+
+func (e *errLog) printf(format string, args ...any) {
+	if time.Since(e.last) < time.Second {
+		e.suppressed++
+		return
+	}
+	if e.suppressed > 0 {
+		format += " (+%d suppressed)"
+		args = append(args, e.suppressed)
+	}
+	log.Printf(format, args...)
+	e.last = time.Now()
+	e.suppressed = 0
+}
+
 // blast is one queue's transmit loop. It keeps the tx ring full: reap
 // completions, allocate as many frames as there is ring space, stamp each with
 // an incrementing source port, and transmit. One goroutine owns this socket's
 // transmit side, so no locking is needed.
 func blast(xsk *afxdp.Socket, template []byte, srcPortOff int, startPort uint16, bytes *atomic.Uint64, stop *atomic.Bool) {
 	const batch = 256
+	var el errLog
 	port := startPort
 	for !stop.Load() {
 		// SendFunc fills each frame in place and handles all the ring
@@ -148,7 +173,11 @@ func blast(xsk *afxdp.Socket, template []byte, srcPortOff int, startPort uint16,
 			return len(template)
 		})
 		if err != nil {
-			log.Fatalf("SendFunc: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return // socket closed under us during shutdown
+			}
+			el.printf("SendFunc: %v", err)
+			continue
 		}
 		bytes.Add(uint64(n) * uint64(len(template)))
 	}

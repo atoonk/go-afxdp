@@ -27,8 +27,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -108,6 +110,7 @@ func main() {
 // reflectQueue runs one queue's receive+transmit loop. A single goroutine owns
 // both directions of this socket, so no locking is needed.
 func reflectQueue(q int, xsk *afxdp.Socket) {
+	var el errLog
 	for {
 		// Reclaim sent frames and keep the kernel supplied with rx buffers.
 		xsk.Complete(xsk.NumCompleted())
@@ -115,8 +118,13 @@ func reflectQueue(q int, xsk *afxdp.Socket) {
 
 		n, err := xsk.Poll(-1)
 		if err != nil {
-			log.Printf("queue %d poll: %v", q, err)
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return // fleet closed; normal shutdown
+			}
+			// Ride through errors instead of killing this queue's goroutine:
+			// a dead queue silently blackholes its share of the RSS traffic.
+			el.printf("queue %d poll: %v", q, err)
+			continue
 		}
 		rx := xsk.Receive(n)
 		if len(rx) == 0 {
@@ -160,4 +168,27 @@ func swap(f []byte, a, b, n int) {
 	for i := 0; i < n; i++ {
 		f[a+i], f[b+i] = f[b+i], f[a+i]
 	}
+}
+
+// errLog logs at most one line per second, counting suppressed repeats. A
+// dataplane loop can see millions of errors per second; neither crashing the
+// process nor logging unbounded is acceptable there. One instance per
+// goroutine, so no locking is needed.
+type errLog struct {
+	last       time.Time
+	suppressed int
+}
+
+func (e *errLog) printf(format string, args ...any) {
+	if time.Since(e.last) < time.Second {
+		e.suppressed++
+		return
+	}
+	if e.suppressed > 0 {
+		format += " (+%d suppressed)"
+		args = append(args, e.suppressed)
+	}
+	log.Printf(format, args...)
+	e.last = time.Now()
+	e.suppressed = 0
 }

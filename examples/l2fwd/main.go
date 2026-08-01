@@ -23,8 +23,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -84,6 +86,7 @@ func main() {
 		}
 	}()
 
+	var el errLog
 	for {
 		// Reclaim any transmit frames the kernel finished sending.
 		xsk.Complete(xsk.NumCompleted())
@@ -92,7 +95,14 @@ func main() {
 		xsk.Fill(xsk.NumFreeFillSlots())
 		n, err := xsk.Poll(-1)
 		if err != nil {
-			log.Fatalf("poll: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				log.Print("socket closed; exiting")
+				return
+			}
+			// Never crash (or log unbounded) on an error in the packet loop:
+			// a dataplane rides through it and says so at most once a second.
+			el.printf("poll: %v", err)
+			continue
 		}
 		rx := xsk.Receive(n)
 		if len(rx) == 0 {
@@ -124,4 +134,27 @@ func swapMAC(frame []byte) {
 	copy(tmp[:], frame[0:6])
 	copy(frame[0:6], frame[6:12])
 	copy(frame[6:12], tmp[:])
+}
+
+// errLog logs at most one line per second, counting suppressed repeats. A
+// dataplane loop can see millions of errors per second; neither crashing the
+// process nor logging unbounded is acceptable there. One instance per
+// goroutine, so no locking is needed.
+type errLog struct {
+	last       time.Time
+	suppressed int
+}
+
+func (e *errLog) printf(format string, args ...any) {
+	if time.Since(e.last) < time.Second {
+		e.suppressed++
+		return
+	}
+	if e.suppressed > 0 {
+		format += " (+%d suppressed)"
+		args = append(args, e.suppressed)
+	}
+	log.Printf(format, args...)
+	e.last = time.Now()
+	e.suppressed = 0
 }
