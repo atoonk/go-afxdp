@@ -420,7 +420,7 @@ log.Printf("started: %s", info)
 
 s, _ := fleet.Stats() // e.g. once a second
 log.Print(s)
-// rx=1530244 tx=0 packets, rx_drops=12
+// rx=1530244 tx=0 packets, 19 pkt/poll, rx_drops=12
 ```
 
 `Info` exposes the interface, NIC driver, queue count, frame size and count, the
@@ -435,6 +435,33 @@ per-packet bookkeeping in your loop) and the kernel's drop and error counters
 when you need to find a hot or dropping queue. All counters are cumulative, so
 sample twice and subtract for a rate. Byte counts are not included, the kernel
 does not track them, so sum frame lengths in your loop if you need them.
+
+### Syscall counters
+
+Three counters expose what the library is doing with syscalls, which is usually
+what you want when a loop is slower than expected:
+
+| field | meaning |
+| --- | --- |
+| `Polls` | blocking `poll(2)` calls on the receive side |
+| `Kicks` | `sendto(2)` kicks issued on the transmit side |
+| `KicksSuppressed` | transmit kicks skipped because need-wakeup showed the driver awake |
+
+`Stats.PacketsPerPoll()` divides `Received` by `Polls`: how many packets each
+receive syscall paid for, i.e. how well your loop batches. A `drop` sink at
+12 Mpps over 12 zero-copy ixgbe queues measures about 20 packets per poll; a
+value near 1 means a syscall per packet, usually because the loop drains less
+per wakeup than is waiting. `KicksSuppressed` climbing on a zero-copy link means
+[need-wakeup](#need-wakeup) is doing its job.
+
+```go
+s, _ := xsk.Stats()
+log.Printf("%.0f pkt/poll, %d polls, %d kicks (%d suppressed)",
+    s.PacketsPerPoll(), s.Polls, s.Kicks, s.KicksSuppressed)
+```
+
+[`examples/drop`](examples/drop) prints `polls/s` and `pkt/poll` on its
+per-second line — that is where these are easiest to see against real traffic.
 
 ## Cleanup and lifecycle
 
