@@ -3,6 +3,7 @@
 package afxdp
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -130,6 +131,172 @@ func receiveCount(xsk *Socket, want int, deadline time.Time) int {
 		xsk.Recycle(descs)
 	}
 	return got
+}
+
+// setMTU raises the MTU on both ends of a veth pair so jumbo-sized frames can
+// cross it.
+func setMTU(t *testing.T, mtu int, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		l, err := netlink.LinkByName(name)
+		if err != nil {
+			t.Fatalf("look up %s: %v", name, err)
+		}
+		if err := netlink.LinkSetMTU(l, mtu); err != nil {
+			t.Skipf("cannot set MTU %d on %s: %v", mtu, name, err)
+		}
+	}
+}
+
+// jumboFrame builds a packet of n bytes with the test EtherType and a
+// position-dependent payload, so a truncated or mis-ordered reassembly is
+// detectable rather than merely shorter.
+func jumboFrame(n int) []byte {
+	f := make([]byte, n)
+	for i := 0; i < 6; i++ {
+		f[i] = 0xff
+	}
+	f[12], f[13] = 0x88, 0xb5
+	for i := 14; i < n; i++ {
+		f[i] = byte(i * 7)
+	}
+	return f
+}
+
+// TestVethMultiBuffer is the jumbo path end to end: a payload several times the
+// UMEM frame size must cross the wire as a chain of descriptors and come back
+// out byte-identical.
+func TestVethMultiBuffer(t *testing.T) {
+	ifA, ifB := newVethPair(t)
+	setMTU(t, 9000, ifA, ifB)
+
+	// 2048-byte frames against a 6000-byte packet forces a 3-fragment chain.
+	const frameSize, pktLen = 2048, 6000
+	mb := []Option{WithMultiBuffer(), WithFrameSize(frameSize)}
+	tx, rx := openVethFleets(t, ifA, ifB, mb...)
+	rx.Close() // reopen the receiver with multi-buffer too
+	rxFleet, err := Open(ifB, append([]Option{WithGenericMode(), WithFilter(MatchAll())}, mb...)...)
+	if err != nil {
+		t.Skipf("cannot open multi-buffer rx fleet on %s: %v", ifB, err)
+	}
+	defer rxFleet.Close()
+
+	txSock, rxSock := tx.Sockets()[0], rxFleet.Sockets()[0]
+	want := jumboFrame(pktLen)
+
+	got := make(chan Packet, 1)
+	go func() {
+		buf := make([]byte, pktLen*2)
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			rxSock.Fill(rxSock.FreeRxFrames())
+			if _, err := rxSock.Poll(100 * time.Millisecond); err != nil {
+				return
+			}
+			pkts := rxSock.ReceivePackets(64)
+			for _, p := range pkts {
+				n := rxSock.CopyOut(p, buf)
+				if n == pktLen && buf[12] == 0x88 && buf[13] == 0xb5 {
+					cp := append(Packet(nil), p...)
+					// Copy the bytes out before recycling the frames.
+					flat := append([]byte(nil), buf[:n]...)
+					rxSock.RecyclePackets(pkts)
+					if !bytes.Equal(flat, want) {
+						t.Errorf("reassembled packet differs from what was sent")
+					}
+					got <- cp
+					return
+				}
+			}
+			rxSock.RecyclePackets(pkts)
+		}
+		close(got)
+	}()
+
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		n, err := txSock.SendBatch([][]byte{want})
+		if err != nil {
+			t.Fatalf("SendBatch: %v", err)
+		}
+		if n == 1 {
+			break
+		}
+	}
+
+	select {
+	case p, ok := <-got:
+		if !ok {
+			t.Fatal("jumbo packet never arrived")
+		}
+		if len(p) < 2 {
+			t.Errorf("packet arrived as %d fragment(s), want a multi-fragment chain "+
+				"(%d bytes over %d-byte frames)", len(p), pktLen, frameSize)
+		}
+		if p.Len() != pktLen {
+			t.Errorf("Packet.Len() = %d, want %d", p.Len(), pktLen)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("timed out waiting for the jumbo packet")
+	}
+}
+
+// TestSendBatchOversizedWithoutMultiBuffer pins the non-multi-buffer contract:
+// an oversized payload is an error, never a silent truncation on the wire.
+func TestSendBatchOversizedWithoutMultiBuffer(t *testing.T) {
+	ifA, ifB := newVethPair(t)
+	tx, _ := openVethFleets(t, ifA, ifB, WithFrameSize(2048))
+	txSock := tx.Sockets()[0]
+
+	if txSock.multiBuffer() {
+		t.Fatal("socket bound with XDP_USE_SG without WithMultiBuffer")
+	}
+	n, err := txSock.SendBatch([][]byte{make([]byte, 4096)})
+	if err == nil {
+		t.Fatal("SendBatch accepted a payload larger than FrameSize")
+	}
+	if n != 0 {
+		t.Errorf("SendBatch queued %d packets alongside an error, want 0", n)
+	}
+
+	// Single-frame packets must still group one-per-Packet through the
+	// multi-buffer reader, so ReceivePackets is safe to use unconditionally.
+	if got := txSock.ReceivePackets(8); len(got) != 0 {
+		t.Errorf("ReceivePackets on an idle tx socket returned %d packets", len(got))
+	}
+}
+
+// TestSendBatchChainTooLong pins the multi-buffer transmit ceiling: a payload
+// needing more frames than a packet may span is an error, not a chain the
+// kernel will silently refuse.
+func TestSendBatchChainTooLong(t *testing.T) {
+	ifA, ifB := newVethPair(t)
+	setMTU(t, 9000, ifA, ifB)
+	const frameSize = 2048
+	tx, _ := openVethFleets(t, ifA, ifB, WithMultiBuffer(), WithFrameSize(frameSize))
+	txSock := tx.Sockets()[0]
+
+	if !txSock.multiBuffer() {
+		t.Fatal("WithMultiBuffer did not set XDP_USE_SG")
+	}
+
+	// One frame past the limit.
+	tooBig := make([]byte, frameSize*(maxTxSegs+1))
+	n, err := txSock.SendBatch([][]byte{tooBig})
+	if err == nil {
+		t.Fatalf("SendBatch accepted a payload spanning %d frames, limit is %d",
+			maxTxSegs+1, maxTxSegs)
+	}
+	if n != 0 {
+		t.Errorf("SendBatch queued %d packets alongside an error, want 0", n)
+	}
+
+	// Exactly at the limit must still be accepted, so the check is a ceiling
+	// and not an off-by-one that rejects legal chains.
+	atLimit := make([]byte, frameSize*maxTxSegs)
+	if _, err := txSock.SendBatch([][]byte{atLimit}); err != nil {
+		t.Errorf("SendBatch rejected a payload spanning exactly %d frames: %v", maxTxSegs, err)
+	}
 }
 
 // TestVethEndToEnd sends packets across a veth pair through the full

@@ -145,6 +145,8 @@ type config struct {
 	keepManagement bool     // pass management traffic to the kernel (see WithKeepManagement)
 	mgmtTCPPorts   []uint16 // TCP ports treated as management; defaults to 22
 
+	multiBuffer bool // load the XDP program with BPF_F_XDP_HAS_FRAGS (see WithMultiBuffer)
+
 	// NAPI auto-tuning (see WithoutAutoTune). noAutoTune disables it; the two
 	// values are zero unless WithNAPITuning overrode them.
 	noAutoTune    bool
@@ -278,6 +280,33 @@ func WithNeedWakeup() Option {
 	return func(c *config) { c.opts.BindFlags |= unix.XDP_USE_NEED_WAKEUP }
 }
 
+// WithMultiBuffer enables multi-buffer (scatter-gather) mode, which lets a
+// packet span several UMEM frames instead of being limited to one. It is what
+// makes jumbo frames work: at the default 4096-byte frame size a 9001-byte
+// packet arrives as three chained descriptors.
+//
+// Two things change. The XDP program is loaded with BPF_F_XDP_HAS_FRAGS, which
+// is also what lets it attach at all on drivers that otherwise cap the MTU for
+// XDP (AWS ENA refuses a native attach above 3502 bytes without it). And the
+// socket binds with XDP_USE_SG, without which the kernel silently drops every
+// multi-buffer packet.
+//
+// Use ReceivePackets rather than Receive to read chained packets: Receive
+// returns one Desc per *frame*, so a jumbo packet looks like several unrelated
+// descriptors. SendBatch splits oversized payloads across frames for you.
+//
+// The cost is zero-copy. A device reports its multi-buffer zero-copy limit as
+// xdp-zc-max-segs; where that is 1 (AWS ENA today) the kernel refuses an
+// XDP_USE_SG bind in zero-copy mode, so Open settles for native copy mode.
+// Check Info().ZeroCopy if that matters to you — on such a NIC, lowering the
+// MTU and leaving this option off is faster than turning it on.
+func WithMultiBuffer() Option {
+	return func(c *config) {
+		c.multiBuffer = true
+		c.opts.BindFlags |= unix.XDP_USE_SG
+	}
+}
+
 // WithKeepManagement keeps the traffic that keeps you logged in out of the
 // capture, so you can point a broad filter — MatchAll() in particular — at the
 // same NIC you are administering the box through without cutting yourself off:
@@ -325,7 +354,7 @@ func WithKeepManagement(extraTCPPorts ...uint16) Option {
 // By default Open defers NAPI on a native-mode NIC (napi_defer_hard_irqs and
 // gro_flush_timeout under /sys/class/net/<iface>/) so the kernel batches packets
 // instead of waking the receiver thousands of times a second. On a 100G Mellanox
-// sink that is the difference between 36.5 and 14 of 48 cores for the same
+// sink that took the receiver from 36.5 to 24.2 of 48 cores for the same
 // 118.8 Mpps — the single biggest tuning win we measured, and the sort of thing
 // this library is meant to get right for you rather than leave in a README.
 //

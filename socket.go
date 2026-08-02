@@ -108,6 +108,14 @@ type Socket struct {
 	popScratch []uint64
 	numFilled  int
 
+	// Multi-buffer receive state, owned by the receive goroutine. A chained
+	// packet can straddle two ReceivePackets calls when the batch boundary
+	// lands mid-packet, so the fragments seen so far are held here until the
+	// descriptor that ends the packet arrives. See ReceivePackets.
+	pktScratch []Packet
+	pktPartial []Desc
+	pktDescs   []Desc
+
 	// Transmit-side state, owned by the transmit goroutine.
 	txPool         *framePool
 	txScratch      []Desc
@@ -767,9 +775,15 @@ func (xsk *Socket) FreeTxFrames() int { return xsk.txPool.len() }
 // rejects the whole batch up front with an error rather than truncating it on
 // the wire, and queues nothing.
 func (xsk *Socket) SendBatch(payloads [][]byte) (int, error) {
+	if xsk.multiBuffer() {
+		// Multi-buffer socket: split oversized payloads across frames instead
+		// of rejecting them.
+		return xsk.sendBatchSG(payloads)
+	}
 	for i, p := range payloads {
 		if len(p) > xsk.options.FrameSize {
-			return 0, fmt.Errorf("afxdp: SendBatch payload %d is %d bytes, larger than FrameSize %d",
+			return 0, fmt.Errorf("afxdp: SendBatch payload %d is %d bytes, larger than FrameSize %d "+
+				"(pass WithMultiBuffer to split packets across frames)",
 				i, len(p), xsk.options.FrameSize)
 		}
 	}
