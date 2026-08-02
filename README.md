@@ -317,6 +317,15 @@ Match builders:
 | `MatchAll()` | every packet, the deliberate "take everything" |
 | `MatchNone()` | nothing, attach without redirecting (e.g. zero copy TX for a sender) |
 
+That is every builder. The options that install them, and the one exception to
+them, are:
+
+| Option | Effect |
+|--------|--------|
+| `WithFilter(matches...)` | redirect packets matching **any** of these builders |
+| `WithUDPPorts(ports...)` | shorthand for `WithFilter(MatchUDPPort(ports...))` |
+| `WithKeepManagement(extraTCPPorts...)` | the inverse: keep ARP, IPv6 ND, SSH and DNS replies *out* of the capture so a broad filter cannot lock you out of the box ([below](#keeping-your-session-alive-withkeepmanagement)) |
+
 Each match is compiled to eBPF instructions with
 [`github.com/cilium/ebpf/asm`](https://pkg.go.dev/github.com/cilium/ebpf/asm) into
 a single XDP program, loaded and checked by the kernel verifier (the test suite
@@ -333,7 +342,7 @@ skips a single 802.1Q VLAN tag, so the same filter works whether or not the NIC
 strips the tag before XDP — stacked QinQ tags are not unwound. For classification
 beyond these builders, redirect everything and classify in your receive loop.
 
-### Not cutting off your own SSH
+### Keeping your session alive: `WithKeepManagement`
 
 `MatchAll()` on the NIC you are logged in through takes every packet away from the
 kernel, including the ones carrying your session. `WithKeepManagement()` leaves
