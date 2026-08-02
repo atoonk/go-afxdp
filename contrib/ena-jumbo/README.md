@@ -140,6 +140,7 @@ package main
 
 import (
 	"log"
+	"sync"
 	"time"
 
 	xdp "github.com/atoonk/go-afxdp"
@@ -161,27 +162,42 @@ func main() {
 		log.Fatalf("got %s XDP, wanted native: the driver patch is not in effect", info.XDPMode)
 	}
 
-	xsk := fleet.Sockets()[0]
-	buf := make([]byte, 65536)
+	// One goroutine per queue. The NIC spreads packets across all of them by
+	// RSS hash, so reading only Sockets()[0] will usually see nothing at all:
+	// the XDP program still redirects the packets, they just pile up unread on
+	// whichever queue they landed on.
+	var wg sync.WaitGroup
 	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		xsk.Fill(xsk.FreeRxFrames())
-		if _, err := xsk.Poll(200 * time.Millisecond); err != nil {
-			break
-		}
-		pkts := xsk.ReceivePackets(64)
-		for _, p := range pkts {
-			n := xsk.CopyOut(p, buf)
-			log.Printf("got a %d byte packet spanning %d frame(s)", n, len(p))
-		}
-		xsk.RecyclePackets(pkts)
+	for i, xsk := range fleet.Sockets() {
+		wg.Add(1)
+		go func(q int, xsk *xdp.Socket) {
+			defer wg.Done()
+			buf := make([]byte, 65536)
+			for time.Now().Before(deadline) {
+				xsk.Fill(xsk.FreeRxFrames())
+				if _, err := xsk.Poll(200 * time.Millisecond); err != nil {
+					return
+				}
+				pkts := xsk.ReceivePackets(64)
+				for _, p := range pkts {
+					n := xsk.CopyOut(p, buf)
+					log.Printf("queue %d: got a %d byte packet spanning %d frame(s)", q, n, len(p))
+				}
+				xsk.RecyclePackets(pkts)
+			}
+		}(i, xsk)
 	}
+	wg.Wait()
 }
 ```
 
 ```bash
-go mod init verify && go get github.com/atoonk/go-afxdp && go run .
+go mod init verify && go get github.com/atoonk/go-afxdp && go build -o verify . && ./verify
 ```
+
+Build the binary rather than using `go run` directly: the first `go run` spends
+several seconds compiling, and it is easy to send your test traffic before the
+socket is actually bound.
 
 While it runs, ping this instance from another host with a jumbo payload:
 
@@ -193,9 +209,14 @@ Expected output:
 
 ```
 ens5: 4 queues, copy, native XDP, 8192x4096B frames, driver ena, filter icmp-echo, ...
-got a 8942 byte packet spanning 3 frame(s)
-got a 8942 byte packet spanning 3 frame(s)
+queue 2: got a 8942 byte packet spanning 3 frame(s)
+queue 2: got a 8942 byte packet spanning 3 frame(s)
+queue 2: got a 8942 byte packet spanning 3 frame(s)
 ```
+
+All of one ping flow lands on a single queue, because RSS hashes on the flow.
+Which queue it picks is not predictable, and that is exactly why the program
+above reads all of them.
 
 Three things to look for:
 
