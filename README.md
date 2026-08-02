@@ -175,30 +175,28 @@ refused), 64-byte frames:
 | 4 | 51.5 Mpps | 4.0 | 34.0 Mpps | 1.6 | 64 |
 | 8 | 95.2 Mpps | 8.0 | 73.6 Mpps | 2.3 | 64 |
 | 16 | 141.3 Mpps | 16.0 | 116.9 Mpps | 4.0 | 64 |
-| 24 | 138.4 Mpps | 22.9 | 115.2 Mpps | 9.2 | 56 |
-| 32 | 139.5 Mpps | 22.4 | 118.4 Mpps | 13.7 | 53 |
-| 48 | 138.9 Mpps | 22.7 | 118.8 Mpps | 21.4 | 39 |
+| 32 | 139.5 Mpps | 22.4 | 118.4 Mpps | 5.0 | 78 |
+| 48 | 138.9 Mpps | 22.7 | 118.8 Mpps | 5.7 | 92 |
 
 Transmit scales linearly at about **13.6 Mpps per core** and reaches line rate at
 16 queues. Receive costs far less userspace CPU because the expensive half — the
 driver's NAPI poll and the XDP redirect — runs in softirq, not in the process;
 a single queue tops out near 7.7 Mpps while our loop consumes it with half a core.
 
-**More queues is not better.** Past 16 nothing gets faster, but everything gets
-more expensive: batches thin out (64 packets per `poll(2)` down to 39, visible as
-`Stats.PacketsPerPoll`), so the same traffic costs more syscalls and more CPU.
-Measured box-wide on the receiver, 16 queues carried 116 Mpps using 19.5 of 48
-cores, while 48 queues carried 119 Mpps using 36.5 — nearly double the machine for
-2% more throughput.
+**More queues is not better.** Past 16 nothing gets faster — transmit is at line
+rate and receive is at the NIC's limit — but the receiver keeps costing more CPU.
+Measured box-wide, 16 queues carried 116 Mpps using 19.5 of 48 cores, while 48
+queues carried 119 Mpps using 24.2 — noticeably more machine for 2% more
+throughput.
 
 ### NAPI batching (done for you)
 
 Left alone, the kernel wakes an AF_XDP receiver once per NAPI poll, and at these
-rates that is far too often — 5.7 million wakeups a second carrying 18 packets
-each. The receiver then burns its CPU on syscall entry and poll machinery instead
-of on packets: profiling the 48-queue sink put `os_xsave`, `sock_poll`,
-`eventfd_poll` and interrupt dispatch at the top, with the functions that actually
-move packets (`__xsk_map_redirect`, `__xsk_rcv_zc`) nowhere near it.
+rates that is millions of times a second — far more often than it needs to. The
+receiver then burns its CPU on syscall entry and poll machinery instead of on
+packets: profiling the 48-queue sink put `os_xsave`, `sock_poll`, `eventfd_poll`
+and interrupt dispatch at the top, with the functions that actually move packets
+(`__xsk_map_redirect`, `__xsk_rcv_zc`) nowhere near it.
 
 **`Open` fixes this for you.** On a native-mode NIC it sets
 `napi_defer_hard_irqs=2` and `gro_flush_timeout=200µs` so the kernel lets packets
@@ -207,12 +205,13 @@ accumulate, and restores your previous values on `Close`. Same traffic, same
 
 | | packets per poll | polls/s | box busy |
 | --- | --- | --- | --- |
-| kernel default | 18 | 5.7M | 36.5 of 48 cores |
-| what `Open` applies | 74 | 1.6M | **14.0 of 48 cores** |
+| kernel default | 39 | 3.0M | 36.5 of 48 cores |
+| what `Open` applies | 92 | 1.3M | **24.2 of 48 cores** |
 
-Same throughput for **less than half the machine**, which is why this is on by
-default rather than a tuning tip. `Fleet.Info()` reports it (`napi defer=2
-flush=200µs`) so it is never invisible.
+Same throughput for **about a third less of the machine**, which is why this is on
+by default rather than a tuning tip. (A trivial filter that does no per-packet
+work benefits even more; the numbers above are a realistic UDP sink.)
+`Fleet.Info()` reports it (`napi defer=2 flush=200µs`) so it is never invisible.
 
 Worth knowing, since these are properties of the interface rather than of your
 process:

@@ -116,8 +116,8 @@ SSH packets were passed through.
 
 Open also defers NAPI on a native-mode NIC (napi_defer_hard_irqs and
 gro_flush_timeout) so the kernel batches packets instead of waking the receiver
-millions of times a second — on a 100G NIC that is 14 cores instead of 36 for the
-same 118 Mpps. Your previous values are restored on Close and reported by
+millions of times a second — on a 100G NIC that is about a third less receive CPU
+for the same 118 Mpps. Your previous values are restored on Close and reported by
 Fleet.Info; use WithoutAutoTune to manage them yourself, or WithNAPITuning to
 change them. Generic/SKB mode is never touched.
 

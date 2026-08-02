@@ -325,7 +325,7 @@ func WithKeepManagement(extraTCPPorts ...uint16) Option {
 // By default Open defers NAPI on a native-mode NIC (napi_defer_hard_irqs and
 // gro_flush_timeout under /sys/class/net/<iface>/) so the kernel batches packets
 // instead of waking the receiver thousands of times a second. On a 100G Mellanox
-// sink that is the difference between 36.5 and 14 of 48 cores for the same
+// sink that took the receiver from 36.5 to 24.2 of 48 cores for the same
 // 118.8 Mpps — the single biggest tuning win we measured, and the sort of thing
 // this library is meant to get right for you rather than leave in a README.
 //
