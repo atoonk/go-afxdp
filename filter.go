@@ -552,7 +552,7 @@ func filterDesc(matches []Match, exceptions []Match) string {
 // passed to the kernel without ever being offered to the matches. They are
 // ordinary Matches assembled with "pass" as their redirect target, which is what
 // makes any builder usable as an exclusion (see WithKeepManagement).
-func newFilterProgram(maxQueues int, exceptions, matches []Match) (*Program, error) {
+func newFilterProgram(maxQueues int, exceptions, matches []Match, frags bool) (*Program, error) {
 	if len(matches) == 0 {
 		return nil, fmt.Errorf("afxdp: newFilterProgram needs at least one match")
 	}
@@ -578,6 +578,7 @@ func newFilterProgram(maxQueues int, exceptions, matches []Match) (*Program, err
 		prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
 			Name:         "xsk_pass",
 			Type:         ebpf.XDP,
+			Flags:        fragsFlag(frags),
 			Instructions: asm.Instructions{asm.Mov.Imm(asm.R0, xdpPass), asm.Return()},
 			License:      "LGPL-2.1 or BSD-2-Clause",
 		})
@@ -655,6 +656,7 @@ func newFilterProgram(maxQueues int, exceptions, matches []Match) (*Program, err
 	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
 		Name:         "xsk_filter",
 		Type:         ebpf.XDP,
+		Flags:        fragsFlag(frags),
 		Instructions: insns,
 		License:      "LGPL-2.1 or BSD-2-Clause",
 	})

@@ -66,17 +66,28 @@ func TestFilterProgramsVerify(t *testing.T) {
 		{"flow-both-dirs", []Match{MatchFlow("10.0.0.1/32", "10.0.0.2/32"), MatchFlow("10.0.0.2/32", "10.0.0.1/32")}, nil},
 		{"composite", []Match{MatchUDPPort(4789, 51820), MatchICMPEcho(), MatchTCPPort(22), MatchSrcIP("172.16.0.0/12")}, nil},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			prog, err := newFilterProgram(4, tc.exceptions, tc.matches)
-			if err != nil {
-				var ve *ebpf.VerifierError
-				if errors.As(err, &ve) {
-					t.Fatalf("verifier rejected %s:\n%+v", tc.name, ve)
+	// Every filter is loaded twice: once plain and once with
+	// BPF_F_XDP_HAS_FRAGS. Under xdp.frags semantics data_end covers only the
+	// linear head, so a filter that reached past it would verify plain and be
+	// rejected here. Our matches only parse L2/L3/L4 headers, which always live
+	// in the first fragment — this test is what keeps that true.
+	for _, frags := range []bool{false, true} {
+		suffix := ""
+		if frags {
+			suffix = "/frags"
+		}
+		for _, tc := range cases {
+			t.Run(tc.name+suffix, func(t *testing.T) {
+				prog, err := newFilterProgram(4, tc.exceptions, tc.matches, frags)
+				if err != nil {
+					var ve *ebpf.VerifierError
+					if errors.As(err, &ve) {
+						t.Fatalf("verifier rejected %s (frags=%v):\n%+v", tc.name, frags, ve)
+					}
+					t.Skipf("cannot load BPF program in this environment: %v", err)
 				}
-				t.Skipf("cannot load BPF program in this environment: %v", err)
-			}
-			prog.Close()
-		})
+				prog.Close()
+			})
+		}
 	}
 }

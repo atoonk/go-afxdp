@@ -35,9 +35,32 @@ type Program struct {
 	link link.Link
 }
 
+// fragsFlag is the program load flag that marks an XDP program as multi-buffer
+// capable, the Go equivalent of libbpf's "xdp.frags" section name. Drivers that
+// cap the MTU for XDP consult it: AWS ENA refuses a native attach above 3502
+// bytes for a program without it, and allows the full MTU with it.
+func fragsFlag(frags bool) uint32 {
+	if frags {
+		return unix.BPF_F_XDP_HAS_FRAGS
+	}
+	return 0
+}
+
 // NewProgram builds the redirect program with room for maxQueues queue entries.
 // Register one socket per queue with Register before traffic will be delivered.
 func NewProgram(maxQueues int) (*Program, error) {
+	return newRedirectProgram(maxQueues, false)
+}
+
+// NewMultiBufferProgram is NewProgram with BPF_F_XDP_HAS_FRAGS set, so the
+// program can be attached on an interface whose MTU exceeds one frame and can
+// be handed multi-buffer packets. Pair it with sockets bound with XDP_USE_SG;
+// see WithMultiBuffer for the high-level path.
+func NewMultiBufferProgram(maxQueues int) (*Program, error) {
+	return newRedirectProgram(maxQueues, true)
+}
+
+func newRedirectProgram(maxQueues int, frags bool) (*Program, error) {
 	qidconf, err := ebpf.NewMap(&ebpf.MapSpec{
 		Name:       "qidconf_map",
 		Type:       ebpf.Array,
@@ -63,8 +86,9 @@ func NewProgram(maxQueues int) (*Program, error) {
 	// Translation of the default xsk redirect program; see
 	// <linux>/tools/lib/bpf/xsk.c xsk_load_xdp_prog().
 	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
-		Name: "xsk_redirect",
-		Type: ebpf.XDP,
+		Name:  "xsk_redirect",
+		Type:  ebpf.XDP,
+		Flags: fragsFlag(frags),
 		Instructions: asm.Instructions{
 			{OpCode: 97, Dst: 1, Src: 1, Offset: 16},
 			{OpCode: 99, Dst: 10, Src: 1, Offset: -4},

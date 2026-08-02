@@ -165,7 +165,7 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 	// bind variants (zero-copy before copy) without re-attaching.
 	var lastErr error
 	for _, g := range modeGroups(cfg.mode) {
-		prog, err := buildProgram(nQueues, exceptions, cfg.matches)
+		prog, err := buildProgram(nQueues, exceptions, cfg.matches, cfg.multiBuffer)
 		if err != nil {
 			return nil, err // program build failure isn't mode-related
 		}
@@ -239,11 +239,12 @@ func modeGroups(m xdpMode) []modeGroup {
 }
 
 // buildProgram makes the redirect-all or filtered XDP program for nQueues.
-func buildProgram(nQueues int, exceptions, matches []Match) (*Program, error) {
+// frags loads it with BPF_F_XDP_HAS_FRAGS (see WithMultiBuffer).
+func buildProgram(nQueues int, exceptions, matches []Match, frags bool) (*Program, error) {
 	if len(matches) > 0 {
-		return newFilterProgram(nQueues, exceptions, matches)
+		return newFilterProgram(nQueues, exceptions, matches, frags)
 	}
-	return NewProgram(nQueues)
+	return newRedirectProgram(nQueues, frags)
 }
 
 // maxLocalPrefixes caps how many of an interface's addresses the management
