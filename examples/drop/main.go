@@ -38,22 +38,39 @@ func main() {
 	iface := flag.String("iface", "eth0", "interface to bind")
 	port := flag.Int("port", 9999, "UDP port to sink")
 	queues := flag.Int("queues", 0, "rx queues to bind (0 = all)")
+	all := flag.Bool("all", false, "capture every packet instead of just -port")
+	noTune := flag.Bool("no-autotune", false, "leave the interface's NAPI settings alone (see WithoutAutoTune)")
+	keepMgmt := flag.Bool("keep-management", false,
+		"with -all, leave ARP/ND/SSH/DNS with the kernel so you keep your session")
 	flag.Parse()
 
 	// Filter to the one UDP port so only the flood reaches userspace; the rest
 	// of the host's traffic stays with the kernel. Mode is auto-selected.
 	// WithReceiveHeavy because this is a pure sink: it never transmits, so give
 	// the whole UMEM to the receive pool instead of reserving half for tx.
-	fleet, err := afxdp.Open(*iface,
-		afxdp.WithUDPPorts(uint16(*port)),
-		afxdp.WithQueues(*queues),
-		afxdp.WithReceiveHeavy(),
-	)
+	filter := afxdp.WithUDPPorts(uint16(*port))
+	if *all {
+		filter = afxdp.WithFilter(afxdp.MatchAll())
+	}
+	opts := []afxdp.Option{filter, afxdp.WithQueues(*queues), afxdp.WithReceiveHeavy()}
+	if *noTune {
+		opts = append(opts, afxdp.WithoutAutoTune())
+	}
+	if *keepMgmt {
+		// Only meaningful with -all: capturing everything on the interface you
+		// administer the box through takes your own SSH session with it.
+		opts = append(opts, afxdp.WithKeepManagement())
+	}
+	fleet, err := afxdp.Open(*iface, opts...)
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}
 	if info, err := fleet.Info(); err == nil {
-		log.Printf("dropping UDP/%d: %s", *port, info)
+		what := fmt.Sprintf("UDP/%d", *port)
+		if *all {
+			what = "everything"
+		}
+		log.Printf("dropping %s: %s", what, info)
 	}
 
 	// Attaching native XDP bounces the link on many NICs (~10s on ixgbe).

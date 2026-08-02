@@ -31,6 +31,11 @@ type Info struct {
 	ZeroCopy  bool   // true only if every queue is in zero-copy mode
 	XDPMode   string // "native", "generic", "hardware", "none", or "unknown"
 	Filter    string // the applied XDP filter, e.g. "udp/53", "udp/4789 | icmp-echo", or "all"
+	// Tuning describes the NAPI settings Open applied to the interface, e.g.
+	// "defer=2 flush=200ms", or "untuned" when it left them alone (generic
+	// mode, WithoutAutoTune, or no permission to write /sys). See
+	// WithoutAutoTune — these are host settings, so they are worth seeing.
+	Tuning string
 }
 
 // Info gathers a snapshot describing how the Fleet is running. The zero-copy
@@ -46,6 +51,7 @@ func (f *Fleet) Info() (Info, error) {
 		FrameSize: f.opts.FrameSize,
 		NumFrames: f.opts.NumFrames,
 		Filter:    f.filter,
+		Tuning:    f.tuning.String(),
 		XDPMode:   "unknown",
 	}
 
@@ -80,6 +86,9 @@ func (i Info) String() string {
 	}
 	if i.Filter != "" {
 		s += ", filter " + i.Filter
+	}
+	if i.Tuning != "" {
+		s += ", napi " + i.Tuning
 	}
 	return s
 }
