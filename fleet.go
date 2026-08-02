@@ -8,6 +8,7 @@ package afxdp
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,7 @@ type Fleet struct {
 	filter  string // human-readable summary of the applied XDP filter
 	program *Program
 	sockets []*Socket
+	tuning  *napiTuning // NAPI settings we changed and must put back; nil if untuned
 }
 
 // openFleets pins every Fleet returned by Open until Close is called.
@@ -135,7 +137,20 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 		nQueues = cfg.queues
 	}
 
-	filter := filterDesc(cfg.matches)
+	var exceptions []Match
+	if cfg.keepManagement {
+		locals, known, err := localPrefixes(link)
+		if err != nil {
+			return nil, err
+		}
+		// Not knowing the addresses is the only case that widens the rules to
+		// any destination: losing some capture fidelity is recoverable, losing
+		// the box is not. Knowing there are none is different — nothing can be
+		// addressed to the interface, so only ARP/ND are worth passing.
+		exceptions = managementExceptions(locals, cfg.mgmtTCPPorts, !known)
+	}
+
+	filter := filterDesc(cfg.matches, exceptions)
 
 	// Even a transmit-only Fleet (MatchNone) needs its XDP program attached:
 	// in principle AF_XDP TX doesn't require one, but in practice drivers only
@@ -150,7 +165,7 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 	// bind variants (zero-copy before copy) without re-attaching.
 	var lastErr error
 	for _, g := range modeGroups(cfg.mode) {
-		prog, err := buildProgram(nQueues, cfg.matches)
+		prog, err := buildProgram(nQueues, exceptions, cfg.matches)
 		if err != nil {
 			return nil, err // program build failure isn't mode-related
 		}
@@ -172,7 +187,21 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 				lastErr = fmt.Errorf("%s bind: %w", g.label, err)
 				continue
 			}
-			f := &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter, program: prog, sockets: socks}
+			// Defer NAPI so the kernel batches packets instead of waking us
+			// per handful. Only in native mode: that is where it was measured
+			// to matter, and it keeps generic-mode setups (veth, the test
+			// suite) from mutating host state. Best-effort by design — see
+			// applyNAPITuning.
+			var tuning *napiTuning
+			if !cfg.noAutoTune && g.xdpFlags == unix.XDP_FLAGS_DRV_MODE {
+				deferIRQs, flush := defaultNAPIDeferHardIRQs, defaultGROFlushTimeout
+				if cfg.napiFlush > 0 {
+					deferIRQs, flush = cfg.napiDeferIRQs, cfg.napiFlush
+				}
+				tuning = applyNAPITuning(iface, deferIRQs, flush)
+			}
+			f := &Fleet{iface: iface, ifindex: ifindex, opts: opts, filter: filter,
+				program: prog, sockets: socks, tuning: tuning}
 			openFleetsMu.Lock()
 			openFleets[f] = struct{}{}
 			openFleetsMu.Unlock()
@@ -210,11 +239,64 @@ func modeGroups(m xdpMode) []modeGroup {
 }
 
 // buildProgram makes the redirect-all or filtered XDP program for nQueues.
-func buildProgram(nQueues int, matches []Match) (*Program, error) {
+func buildProgram(nQueues int, exceptions, matches []Match) (*Program, error) {
 	if len(matches) > 0 {
-		return newFilterProgram(nQueues, matches)
+		return newFilterProgram(nQueues, exceptions, matches)
 	}
 	return NewProgram(nQueues)
+}
+
+// maxLocalPrefixes caps how many of an interface's addresses the management
+// exceptions are scoped to. Each address multiplies the number of eBPF blocks,
+// and an interface with dozens of addresses would produce a needlessly large
+// program; erroring out is better than silently generating one.
+const maxLocalPrefixes = 16
+
+// localPrefixes returns an interface's addresses as host prefixes (/32, /128),
+// for scoping the management exceptions to traffic addressed to this box. known
+// reports whether the addresses could be read at all — an interface that simply
+// has none returns (nil, true, nil), which is a different situation from a
+// failed lookup and is handled differently by the caller.
+func localPrefixes(link netlink.Link) (prefixes []netip.Prefix, known bool, err error) {
+	addrs, err := netlink.AddrList(link, unix.AF_UNSPEC)
+	if err != nil {
+		return nil, false, nil // caller widens the rules to any destination
+	}
+	// Addresses on VLAN sub-interfaces (and other children such as macvlan)
+	// count too. The XDP program attaches to the parent and sees their traffic,
+	// but the addresses live on the child: a box managed over a tagged VLAN has
+	// nothing but a link-local address on the parent, so scoping to the parent
+	// alone would leave exactly the session we are trying to protect exposed.
+	if children, cerr := netlink.LinkList(); cerr == nil {
+		for _, c := range children {
+			if c.Attrs().ParentIndex != link.Attrs().Index {
+				continue
+			}
+			if ca, aerr := netlink.AddrList(c, unix.AF_UNSPEC); aerr == nil {
+				addrs = append(addrs, ca...)
+			}
+		}
+	}
+	seen := make(map[netip.Prefix]bool) // the same link-local appears on parent and child
+	for _, a := range addrs {
+		ip, ok := netip.AddrFromSlice(a.IP)
+		if !ok {
+			continue
+		}
+		ip = ip.Unmap()
+		p := netip.PrefixFrom(ip, ip.BitLen())
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		prefixes = append(prefixes, p)
+	}
+	if len(prefixes) > maxLocalPrefixes {
+		return nil, false, fmt.Errorf("afxdp: %s has %d addresses, more than WithKeepManagement can scope to (%d); "+
+			"remove addresses or drop WithKeepManagement and write the exceptions you need by hand",
+			link.Attrs().Name, len(prefixes), maxLocalPrefixes)
+	}
+	return prefixes, true, nil
 }
 
 // registerSockets opens and registers one socket per queue against an
@@ -330,5 +412,9 @@ func (f *Fleet) Close() error {
 		}
 		f.program = nil
 	}
+	// Put the interface's NAPI settings back. They belong to the host, not to
+	// us, so leaving them changed after we are gone would be rude.
+	f.tuning.restore()
+	f.tuning = nil
 	return firstErr
 }

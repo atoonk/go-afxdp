@@ -70,8 +70,18 @@ func portsDesc(proto string, ports []uint16) string {
 const (
 	offEtherType = 12 // u16
 	offIPProto   = 23 // u8  (14 + 9)
+	offL4Sport   = 34 // u16 (14 + 20 + 0): same for UDP and TCP
 	offL4Dport   = 36 // u16 (14 + 20 + 2): same for UDP and TCP
 	offICMPType  = 34 // u8  (14 + 20 + 0)
+
+	// IPv6 equivalents. The IPv6 header is a fixed 40 bytes, so L4 starts at
+	// 14+40; these are only correct when Next Header is the L4 protocol itself
+	// (no extension headers), which is the case for the management traffic
+	// these are used for.
+	offIPv6NextHdr = 20 // u8  (14 + 6)
+	offIPv6L4Sport = 54 // u16 (14 + 40 + 0)
+	offIPv6L4Dport = 56 // u16 (14 + 40 + 2)
+	offICMPv6Type  = 54 // u8  (14 + 40 + 0)
 
 	// IP address offsets. These are fixed regardless of IPv4 options or IPv6
 	// extension headers, so address matching needs no header walking.
@@ -83,11 +93,19 @@ const (
 	etherTypeIPv4LE = 0x0008 // htons(0x0800) as seen by a little-endian load
 	etherTypeIPv6LE = 0xdd86 // htons(0x86dd)
 	etherTypeVLANLE = 0x0081 // htons(0x8100), the 802.1Q tag TPID; l3Base skips it
+	etherTypeARP    = 0x0806
 	ipProtoICMP     = 1
 	ipProtoTCP      = 6
 	ipProtoUDP      = 17
+	ipProtoICMPv6   = 58
 	icmpEchoRequest = 8
-	xdpPass         = 2
+
+	// IPv6 neighbour discovery message types (RFC 4861): router solicitation
+	// and advertisement, neighbour solicitation and advertisement, redirect.
+	icmpv6NDFirst = 133
+	icmpv6NDLast  = 137
+
+	xdpPass = 2
 )
 
 // netshort returns the network-byte-order (big-endian) value of a port as a
@@ -356,6 +374,132 @@ func cidrTest(off int, prefix netip.Prefix, fail string) asm.Instructions {
 	return ins
 }
 
+// matchLocalPort matches packets of the given IP protocol whose source or
+// destination L4 port equals port AND whose destination address is local (inside
+// local). It is the AND that the public builders cannot express: WithFilter
+// combines matches with OR, and keeping management traffic alive needs
+// "port 22 AND addressed to this box", so transit traffic on port 22 through a
+// router is still captured.
+//
+// The address family of local selects the IPv4 or IPv6 field offsets. A zero
+// Prefix means "any destination", used as the fail-safe when an interface's
+// addresses cannot be determined.
+func matchLocalPort(proto uint8, srcPort bool, port uint16, local netip.Prefix, family4 bool) Match {
+	dir := "dport"
+	if srcPort {
+		dir = "sport"
+	}
+	protoName := map[uint8]string{ipProtoTCP: "tcp", ipProtoUDP: "udp"}[proto]
+	scope := "any"
+	if local.IsValid() {
+		scope = local.Addr().String()
+		family4 = local.Addr().Is4()
+	}
+	return Match{
+		desc: fmt.Sprintf("%s %s %d -> %s", protoName, dir, port, scope),
+		build: func(entry, next, redirect string) asm.Instructions {
+			etherType, protoOff, portOff, dstOff, end := int32(etherTypeIPv4LE),
+				int16(offIPProto), int16(offL4Dport), offIPv4Dst, int32(offIPv4Dst+4)
+			if srcPort {
+				portOff = offL4Sport
+			}
+			if !family4 {
+				etherType, protoOff, portOff, dstOff, end = etherTypeIPv6LE,
+					offIPv6NextHdr, offIPv6L4Dport, offIPv6Dst, offIPv6Dst+16
+				if srcPort {
+					portOff = offIPv6L4Sport
+				}
+			}
+			// Cover both the address and the L4 port with one bounds check.
+			if p := int32(portOff) + 2; p > end {
+				end = p
+			}
+			ins := l3Base(entry, next)
+			ins = append(ins, boundsFrom(asm.R9, end, next)...)
+			ins = append(ins,
+				asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
+				asm.JNE.Imm(asm.R3, etherType, next),
+				asm.LoadMem(asm.R3, asm.R9, protoOff, asm.Byte),
+				asm.JNE.Imm(asm.R3, int32(proto), next),
+				asm.LoadMem(asm.R3, asm.R9, portOff, asm.Half),
+				asm.JNE.Imm(asm.R3, netshort(port), next),
+			)
+			if local.IsValid() {
+				ins = append(ins, cidrTest(dstOff, local, next)...) // not ours -> next
+			}
+			ins = append(ins, asm.Ja.Label(redirect))
+			return withEntry(entry, ins)
+		},
+	}
+}
+
+// matchICMPv6ND matches IPv6 neighbour discovery (RFC 4861 types 133-137).
+// Passing these to the kernel is what keeps IPv6 connectivity alive: they are
+// the IPv6 equivalent of ARP, and without them the kernel cannot resolve or
+// keep the gateway's link-layer address.
+func matchICMPv6ND() Match {
+	return Match{desc: "icmpv6-nd", build: func(entry, next, redirect string) asm.Instructions {
+		ins := l3Base(entry, next)
+		ins = append(ins, boundsFrom(asm.R9, offICMPv6Type+1, next)...)
+		ins = append(ins,
+			asm.LoadMem(asm.R3, asm.R9, offEtherType, asm.Half),
+			asm.JNE.Imm(asm.R3, etherTypeIPv6LE, next),
+			asm.LoadMem(asm.R3, asm.R9, offIPv6NextHdr, asm.Byte),
+			asm.JNE.Imm(asm.R3, ipProtoICMPv6, next),
+			asm.LoadMem(asm.R3, asm.R9, offICMPv6Type, asm.Byte),
+			asm.JLT.Imm(asm.R3, icmpv6NDFirst, next),
+			asm.JGT.Imm(asm.R3, icmpv6NDLast, next),
+			asm.Ja.Label(redirect),
+		)
+		return withEntry(entry, ins)
+	}}
+}
+
+// managementExceptions builds the rule set that WithKeepManagement passes to the
+// kernel instead of redirecting: ARP and IPv6 ND (without which the kernel loses
+// the gateway's link-layer address within about a minute and the box goes
+// unreachable no matter what else is passed), inbound SSH, return traffic for
+// outbound SSH, and DNS replies. XDP is ingress-only, so only inbound rules are
+// needed.
+//
+// locals scopes the port rules to this interface's own addresses. With unscoped
+// set the port rules match any destination instead — the fail-safe for when the
+// addresses could not be read at all. With neither (no addresses, read
+// successfully) only ARP and ND are emitted: nothing can be addressed to an
+// interface with no address, so port rules would exclude traffic from the
+// capture while protecting nothing.
+func managementExceptions(locals []netip.Prefix, tcpPorts []uint16, unscoped bool) []Match {
+	type portRule struct {
+		proto   uint8
+		srcPort bool // match the source port (return traffic) rather than dest
+		port    uint16
+	}
+	ms := []Match{MatchEtherType(etherTypeARP), matchICMPv6ND()}
+	var rules []portRule
+	for _, p := range tcpPorts {
+		rules = append(rules,
+			portRule{ipProtoTCP, false, p}, // inbound session to us
+			portRule{ipProtoTCP, true, p},  // return traffic for a session we opened
+		)
+	}
+	rules = append(rules,
+		portRule{ipProtoUDP, true, 53}, // DNS replies
+		portRule{ipProtoTCP, true, 53}, // DNS over TCP replies
+	)
+	for _, r := range rules {
+		if unscoped {
+			ms = append(ms,
+				matchLocalPort(r.proto, r.srcPort, r.port, netip.Prefix{}, true),
+				matchLocalPort(r.proto, r.srcPort, r.port, netip.Prefix{}, false))
+			continue
+		}
+		for _, l := range locals {
+			ms = append(ms, matchLocalPort(r.proto, r.srcPort, r.port, l, l.Addr().Is4()))
+		}
+	}
+	return ms
+}
+
 // MatchAll matches every packet. Use it as a catch-all, or on its own it is
 // equivalent to running with no filter at all.
 func MatchAll() Match {
@@ -381,27 +525,38 @@ func MatchNone() Match {
 
 // filterDesc renders a set of matches as a short human-readable summary, e.g.
 // "udp/53" or "udp/4789 | icmp-echo". No matches means the program redirects
-// everything, reported as "all".
-func filterDesc(matches []Match) string {
-	if len(matches) == 0 {
-		return "all"
+// everything, reported as "all". Exceptions are summarised rather than listed:
+// the management preset expands to a dozen or more blocks and printing them all
+// would bury the part the operator cares about.
+func filterDesc(matches []Match, exceptions []Match) string {
+	desc := "all"
+	if len(matches) > 0 {
+		descs := make([]string, len(matches))
+		for i, m := range matches {
+			descs[i] = m.desc
+		}
+		desc = strings.Join(descs, " | ")
 	}
-	descs := make([]string, len(matches))
-	for i, m := range matches {
-		descs[i] = m.desc
+	if n := len(exceptions); n > 0 {
+		desc += fmt.Sprintf(" (except %d mgmt rules: arp, nd, ssh, dns)", n)
 	}
-	return strings.Join(descs, " | ")
+	return desc
 }
 
 // newFilterProgram assembles an XDP program from the given matches. A packet is
 // redirected if any match matches; otherwise it is passed to the kernel. The
 // redirect path reuses the same qidconf gate + redirect_map tail as NewProgram,
 // so binding a subset of queues stays safe (unbound queues pass, not drop).
-func newFilterProgram(maxQueues int, matches []Match) (*Program, error) {
+//
+// exceptions are evaluated first and win: a packet matching any of them is
+// passed to the kernel without ever being offered to the matches. They are
+// ordinary Matches assembled with "pass" as their redirect target, which is what
+// makes any builder usable as an exclusion (see WithKeepManagement).
+func newFilterProgram(maxQueues int, exceptions, matches []Match) (*Program, error) {
 	if len(matches) == 0 {
 		return nil, fmt.Errorf("afxdp: newFilterProgram needs at least one match")
 	}
-	for _, m := range matches {
+	for _, m := range append(append([]Match{}, exceptions...), matches...) {
 		if m.err != nil {
 			return nil, fmt.Errorf("afxdp: filter: %w", m.err)
 		}
@@ -459,6 +614,16 @@ func newFilterProgram(maxQueues int, matches []Match) (*Program, error) {
 		asm.LoadMem(asm.R6, asm.R1, 4, asm.Word),
 		asm.LoadMem(asm.R7, asm.R1, 0, asm.Word),
 		asm.LoadMem(asm.R8, asm.R1, 16, asm.Word),
+	}
+	// Exceptions first, each redirecting to "pass": a hit leaves the packet with
+	// the kernel and never reaches the accept blocks below.
+	for i, e := range exceptions {
+		entry := fmt.Sprintf("except%d", i)
+		next := "match0"
+		if i+1 < len(exceptions) {
+			next = fmt.Sprintf("except%d", i+1)
+		}
+		insns = append(insns, e.build(entry, next, "pass")...)
 	}
 	for i, m := range matches {
 		entry := fmt.Sprintf("match%d", i)

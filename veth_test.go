@@ -3,9 +3,11 @@
 package afxdp
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"testing"
@@ -251,6 +253,68 @@ func TestPollEarlyOutNotCounted(t *testing.T) {
 	}
 }
 
+// readNAPI returns an interface's two NAPI tuning values.
+func readNAPI(t *testing.T, iface string) (string, string) {
+	t.Helper()
+	d, err := readSysfs(iface, "napi_defer_hard_irqs")
+	if err != nil {
+		t.Skipf("napi_defer_hard_irqs unavailable: %v", err)
+	}
+	g, err := readSysfs(iface, "gro_flush_timeout")
+	if err != nil {
+		t.Skipf("gro_flush_timeout unavailable: %v", err)
+	}
+	return d, g
+}
+
+// TestNAPITuning covers the apply/restore cycle and the refcount that keeps two
+// overlapping fleets on one interface from stranding the host's settings.
+func TestNAPITuning(t *testing.T) {
+	ifA, _ := newVethPair(t)
+	origDefer, origGRO := readNAPI(t, ifA)
+
+	tuning := applyNAPITuning(ifA, 3, 250*time.Microsecond)
+	if tuning == nil {
+		t.Skip("cannot write NAPI sysfs attributes here")
+	}
+	gotDefer, gotGRO := readNAPI(t, ifA)
+	if gotDefer != "3" || gotGRO != "250000" {
+		t.Errorf("after apply: defer=%q gro=%q, want 3 and 250000", gotDefer, gotGRO)
+	}
+
+	// A second user must not re-save the already-tuned values as "original",
+	// and must not restore while the first is still running.
+	second := applyNAPITuning(ifA, 3, 250*time.Microsecond)
+	second.restore()
+	if d, g := readNAPI(t, ifA); d != "3" || g != "250000" {
+		t.Errorf("first user still open but settings changed to defer=%q gro=%q", d, g)
+	}
+
+	tuning.restore()
+	if d, g := readNAPI(t, ifA); d != origDefer || g != origGRO {
+		t.Errorf("after restore: defer=%q gro=%q, want originals %q and %q", d, g, origDefer, origGRO)
+	}
+}
+
+// TestGenericModeNotTuned is the regression test for the decision that only
+// native-mode NICs are auto-tuned. These are host-wide settings, so running the
+// test suite (or anything on veth) must leave the machine exactly as it found
+// it.
+func TestGenericModeNotTuned(t *testing.T) {
+	ifA, ifB := newVethPair(t)
+	beforeDefer, beforeGRO := readNAPI(t, ifB)
+
+	_, rx := openVethFleets(t, ifA, ifB) // generic mode
+	afterDefer, afterGRO := readNAPI(t, ifB)
+	if afterDefer != beforeDefer || afterGRO != beforeGRO {
+		t.Errorf("Open on a generic-mode interface changed NAPI settings: defer %q->%q, gro %q->%q",
+			beforeDefer, afterDefer, beforeGRO, afterGRO)
+	}
+	if info, err := rx.Info(); err == nil && info.Tuning != "untuned" {
+		t.Errorf("Info.Tuning = %q on a generic-mode fleet, want %q", info.Tuning, "untuned")
+	}
+}
+
 // TestPacketsPerPoll covers the derived ratio without needing a socket.
 func TestPacketsPerPoll(t *testing.T) {
 	if got := (Stats{Received: 100, Polls: 0}).PacketsPerPoll(); got != 0 {
@@ -259,6 +323,222 @@ func TestPacketsPerPoll(t *testing.T) {
 	if got := (Stats{Received: 1000, Polls: 10}).PacketsPerPoll(); got != 100 {
 		t.Errorf("PacketsPerPoll() = %v, want 100", got)
 	}
+}
+
+// ipFrame builds an Ethernet+IPv4 frame carrying a TCP or UDP header with the
+// given ports, addressed to dstIP. Only the fields the XDP filter reads are
+// meaningful; nothing here has to be a valid packet on the wire.
+func ipFrame(proto uint8, srcPort, dstPort uint16, dstIP netip.Addr) []byte {
+	f := make([]byte, 60)
+	for i := 0; i < 6; i++ {
+		f[i] = 0xff
+	}
+	f[12], f[13] = 0x08, 0x00 // IPv4
+	f[14] = 0x45              // version 4, 5-word header (no options)
+	f[23] = proto
+	src := netip.MustParseAddr("10.99.99.99").As4()
+	dst := dstIP.As4()
+	copy(f[26:30], src[:])
+	copy(f[30:34], dst[:])
+	binary.BigEndian.PutUint16(f[34:], srcPort)
+	binary.BigEndian.PutUint16(f[36:], dstPort)
+	return f
+}
+
+// ip6Frame is ipFrame for IPv6: Ethernet + a fixed 40-byte IPv6 header (no
+// extension headers) + L4 ports.
+func ip6Frame(proto uint8, srcPort, dstPort uint16, dstIP netip.Addr) []byte {
+	f := make([]byte, 78)
+	for i := 0; i < 6; i++ {
+		f[i] = 0xff
+	}
+	f[12], f[13] = 0x86, 0xdd // IPv6
+	f[14] = 0x60              // version 6
+	f[20] = proto             // next header
+	src := netip.MustParseAddr("fd00:99::99").As16()
+	dst := dstIP.As16()
+	copy(f[22:38], src[:])
+	copy(f[38:54], dst[:])
+	binary.BigEndian.PutUint16(f[54:], srcPort)
+	binary.BigEndian.PutUint16(f[56:], dstPort)
+	return f
+}
+
+// arpFrame builds a minimal ARP frame (only the EtherType is inspected).
+func arpFrame() []byte {
+	f := make([]byte, 60)
+	for i := 0; i < 6; i++ {
+		f[i] = 0xff
+	}
+	f[12], f[13] = 0x08, 0x06 // ARP
+	return f
+}
+
+// TestKeepManagement is the test that matters for WithKeepManagement: with
+// MatchAll() the sockets must receive everything EXCEPT the traffic that keeps
+// the box reachable, and without the option they must receive all of it. The
+// negative half is what makes this meaningful — it fails if the exception
+// blocks silently stop being emitted.
+func TestKeepManagement(t *testing.T) {
+	ifA, ifB := newVethPair(t)
+
+	// Give the receiving end two IPv4 and two IPv6 addresses: the port
+	// exceptions are scoped to the interface's own addresses, and a dual-stack
+	// host with several of each is the case worth proving.
+	linkB, err := netlink.LinkByName(ifB)
+	if err != nil {
+		t.Fatalf("look up %s: %v", ifB, err)
+	}
+	local := netip.MustParseAddr("10.99.42.1")   // first IPv4
+	local2 := netip.MustParseAddr("10.99.43.1")  // second IPv4
+	local6 := netip.MustParseAddr("fd00:42::1")  // first IPv6
+	local62 := netip.MustParseAddr("fd00:43::1") // second IPv6
+	for _, cidr := range []string{
+		local.String() + "/24", local2.String() + "/24",
+		local6.String() + "/64", local62.String() + "/64",
+	} {
+		addr, err := netlink.ParseAddr(cidr)
+		if err != nil {
+			t.Fatalf("parse addr %s: %v", cidr, err)
+		}
+		// NODAD: an IPv6 address stays tentative for a second or so otherwise,
+		// which would race the fleet opening below.
+		addr.Flags |= unix.IFA_F_NODAD
+		if err := netlink.AddrAdd(linkB, addr); err != nil {
+			t.Skipf("cannot add %s to %s: %v", cidr, ifB, err)
+		}
+	}
+
+	// Each probe is (name, frame, wantRedirectedWithKeepManagement).
+	probes := []struct {
+		name  string
+		bytes []byte
+		want  bool // true = should reach AF_XDP even with WithKeepManagement
+	}{
+		{"v4-ssh-inbound", ipFrame(ipProtoTCP, 40000, 22, local), false},
+		{"v4-ssh-inbound-2nd-addr", ipFrame(ipProtoTCP, 40000, 22, local2), false},
+		{"v4-ssh-return", ipFrame(ipProtoTCP, 22, 40000, local), false},
+		{"v4-dns-reply-udp", ipFrame(ipProtoUDP, 53, 40000, local), false},
+		{"v4-dns-reply-tcp", ipFrame(ipProtoTCP, 53, 40000, local), false},
+		{"v6-ssh-inbound", ip6Frame(ipProtoTCP, 40000, 22, local6), false},
+		{"v6-ssh-inbound-2nd-addr", ip6Frame(ipProtoTCP, 40000, 22, local62), false},
+		{"v6-ssh-return", ip6Frame(ipProtoTCP, 22, 40000, local6), false},
+		{"v6-dns-reply-udp", ip6Frame(ipProtoUDP, 53, 40000, local6), false},
+		{"arp", arpFrame(), false},
+		// Transit traffic on port 22 is NOT ours, so it must still be captured:
+		// this is what scoping to the local addresses buys on a router.
+		{"v4-ssh-to-someone-else", ipFrame(ipProtoTCP, 40000, 22, netip.MustParseAddr("10.99.42.77")), true},
+		{"v6-ssh-to-someone-else", ip6Frame(ipProtoTCP, 40000, 22, netip.MustParseAddr("fd00:42::77")), true},
+		{"v4-ordinary-udp", ipFrame(ipProtoUDP, 40000, 9999, local), true},
+		{"v6-ordinary-udp", ip6Frame(ipProtoUDP, 40000, 9999, local6), true},
+	}
+
+	// run sends every probe once and reports which ones reached the sockets.
+	run := func(t *testing.T, keepManagement bool) map[string]bool {
+		t.Helper()
+		rxOpts := []Option{WithGenericMode(), WithFilter(MatchAll())}
+		if keepManagement {
+			rxOpts = append(rxOpts, WithKeepManagement())
+		}
+		tx, err := Open(ifA, WithGenericMode(), WithFilter(MatchNone()))
+		if err != nil {
+			t.Fatalf("open tx: %v", err)
+		}
+		defer tx.Close()
+		rx, err := Open(ifB, rxOpts...)
+		if err != nil {
+			t.Fatalf("open rx: %v", err)
+		}
+		defer rx.Close()
+		if !tx.WaitLinkUp(5 * time.Second) {
+			t.Fatal("veth link did not come up")
+		}
+		txSock, rxSock := tx.Sockets()[0], rx.Sockets()[0]
+
+		// Send each probe several times: a veth carries unrelated kernel
+		// traffic, and one lost frame should not decide the result.
+		for i := 0; i < 5; i++ {
+			for _, p := range probes {
+				if _, err := txSock.SendBatch([][]byte{p.bytes}); err != nil {
+					t.Fatalf("send %s: %v", p.name, err)
+				}
+			}
+		}
+
+		got := map[string]bool{}
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			rxSock.Fill(rxSock.NumFreeFillSlots())
+			n, err := rxSock.Poll(200 * time.Millisecond)
+			if err != nil || n == 0 {
+				continue
+			}
+			descs := rxSock.Receive(n)
+			for _, d := range descs {
+				frame := rxSock.GetFrame(d)
+				for _, p := range probes {
+					if len(frame) >= len(p.bytes) && string(frame[:len(p.bytes)]) == string(p.bytes) {
+						got[p.name] = true
+					}
+				}
+			}
+			rxSock.Recycle(descs)
+		}
+		return got
+	}
+
+	// A VLAN sub-interface with its own address: the XDP program attaches to
+	// the parent, so an address that only exists on the child must still be
+	// protected. This is the common shape for a box managed over a tagged VLAN,
+	// where the parent holds nothing but a link-local address.
+	vlanIP := netip.MustParseAddr("10.99.44.1")
+	vlan := &netlink.Vlan{
+		LinkAttrs: netlink.LinkAttrs{Name: ifB + ".77", ParentIndex: linkB.Attrs().Index},
+		VlanId:    77,
+	}
+	if err := netlink.LinkAdd(vlan); err != nil {
+		t.Skipf("cannot create vlan sub-interface: %v", err)
+	}
+	t.Cleanup(func() { _ = netlink.LinkDel(vlan) })
+	vaddr, err := netlink.ParseAddr(vlanIP.String() + "/24")
+	if err != nil {
+		t.Fatalf("parse vlan addr: %v", err)
+	}
+	if err := netlink.AddrAdd(vlan, vaddr); err != nil {
+		t.Fatalf("add vlan addr: %v", err)
+	}
+	if err := netlink.LinkSetUp(vlan); err != nil {
+		t.Fatalf("set vlan up: %v", err)
+	}
+	probes = append(probes, struct {
+		name  string
+		bytes []byte
+		want  bool
+	}{"v4-ssh-to-vlan-subif-addr", ipFrame(ipProtoTCP, 40000, 22, vlanIP), false})
+
+	t.Run("without", func(t *testing.T) {
+		got := run(t, false)
+		// Plain MatchAll must capture everything, management traffic included.
+		for _, p := range probes {
+			if !got[p.name] {
+				t.Errorf("%s: not captured by plain MatchAll(); the probe or test rig is wrong, "+
+					"which would make the WithKeepManagement half meaningless", p.name)
+			}
+		}
+	})
+
+	t.Run("with", func(t *testing.T) {
+		got := run(t, true)
+		for _, p := range probes {
+			switch {
+			case p.want && !got[p.name]:
+				t.Errorf("%s: should have been captured but was passed to the kernel", p.name)
+			case !p.want && got[p.name]:
+				t.Errorf("%s: should have been left for the kernel but was captured — "+
+					"this is the lockout case WithKeepManagement exists to prevent", p.name)
+			}
+		}
+	})
 }
 
 // TestSendValidation covers the SendBatch/SendFunc error paths: oversized

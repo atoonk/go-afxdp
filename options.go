@@ -7,7 +7,11 @@
 
 package afxdp
 
-import "golang.org/x/sys/unix"
+import (
+	"time"
+
+	"golang.org/x/sys/unix"
+)
 
 // Options configures a Socket's UMEM and rings.
 //
@@ -137,6 +141,15 @@ type config struct {
 	queues  int     // 0 means "all rx queues"
 	matches []Match // packet filter; empty means "redirect all packets"
 	mode    xdpMode // how to attach/bind; default modeAuto picks the best
+
+	keepManagement bool     // pass management traffic to the kernel (see WithKeepManagement)
+	mgmtTCPPorts   []uint16 // TCP ports treated as management; defaults to 22
+
+	// NAPI auto-tuning (see WithoutAutoTune). noAutoTune disables it; the two
+	// values are zero unless WithNAPITuning overrode them.
+	noAutoTune    bool
+	napiDeferIRQs int
+	napiFlush     time.Duration
 }
 
 // xdpMode selects how Open attaches the XDP program and binds the sockets.
@@ -263,6 +276,78 @@ func WithGenericMode() Option { return func(c *config) { c.mode = modeGeneric } 
 // that drive the rings themselves rather than through Poll/Kick.
 func WithNeedWakeup() Option {
 	return func(c *config) { c.opts.BindFlags |= unix.XDP_USE_NEED_WAKEUP }
+}
+
+// WithKeepManagement keeps the traffic that keeps you logged in out of the
+// capture, so you can point a broad filter — MatchAll() in particular — at the
+// same NIC you are administering the box through without cutting yourself off:
+//
+//	afxdp.Open("eth0",
+//		afxdp.WithFilter(afxdp.MatchAll()), // capture everything...
+//		afxdp.WithKeepManagement(),         // ...except what keeps me logged in
+//	)
+//
+// These are passed to the kernel instead of being redirected:
+//
+//   - ARP, and IPv6 neighbour discovery (ICMPv6 types 133-137)
+//   - TCP to and from port 22 (plus any extraTCPPorts), addressed to this
+//     interface
+//   - DNS replies: UDP and TCP with source port 53, addressed to this interface
+//
+// ARP and ND matter more than the SSH rule does. Without them the kernel cannot
+// refresh the gateway's link-layer address, and roughly a minute later the box
+// is unreachable however carefully its SSH packets were passed through.
+//
+// The port rules are scoped to the addresses the interface has when Open is
+// called, so a router still captures transit traffic on port 22 — only traffic
+// addressed to this box is spared. Addresses added afterwards are not covered;
+// reopen the fleet if they change. If the addresses cannot be determined the
+// rules fall back to matching any destination, which captures less but will not
+// strand you.
+//
+// Pass extraTCPPorts for SSH on a non-standard port, or another admin service
+// you need to survive: WithKeepManagement(2222).
+//
+// Two caveats worth knowing. Traffic *from* port 22 or 53 to this host is not
+// captured, so a sender that picks those source ports can dodge the capture —
+// irrelevant for measurement, relevant if you are hunting an adversary. And if
+// you administer the box through a different NIC than the one you are capturing
+// on, you do not need this at all.
+func WithKeepManagement(extraTCPPorts ...uint16) Option {
+	return func(c *config) {
+		c.keepManagement = true
+		c.mgmtTCPPorts = append([]uint16{22}, extraTCPPorts...)
+	}
+}
+
+// WithoutAutoTune leaves the interface's NAPI settings exactly as it found them.
+//
+// By default Open defers NAPI on a native-mode NIC (napi_defer_hard_irqs and
+// gro_flush_timeout under /sys/class/net/<iface>/) so the kernel batches packets
+// instead of waking the receiver thousands of times a second. On a 100G Mellanox
+// sink that is the difference between 36.5 and 14 of 48 cores for the same
+// 118.8 Mpps — the single biggest tuning win we measured, and the sort of thing
+// this library is meant to get right for you rather than leave in a README.
+//
+// The settings are restored when the Fleet is closed, and Fleet.Info reports
+// what was applied. They are properties of the interface rather than of this
+// process, though, so use this option if you would rather manage them yourself,
+// if something else on the box owns that interface's tuning, or if you need the
+// lowest possible latency at low packet rates (deferring can hold a packet for
+// up to the flush timeout when traffic is sparse). Generic/SKB mode is never
+// tuned, so veth and test setups are untouched either way.
+func WithoutAutoTune() Option { return func(c *config) { c.noAutoTune = true } }
+
+// WithNAPITuning overrides the auto-tuning values. deferIRQs sets
+// napi_defer_hard_irqs and flush sets gro_flush_timeout; the defaults are 2 and
+// 200µs. Raising them further batches harder but risks the NIC dropping because
+// NAPI stops running often enough — at 10 and 500µs our 100G sink fell from
+// 118.8 to 77 Mpps with 29M discards a second. See WithoutAutoTune.
+func WithNAPITuning(deferIRQs int, flush time.Duration) Option {
+	return func(c *config) {
+		c.napiDeferIRQs = deferIRQs
+		c.napiFlush = flush
+	}
 }
 
 // WithOptions replaces the whole Options struct, for full manual control. Apply

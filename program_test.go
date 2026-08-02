@@ -4,6 +4,7 @@ package afxdp
 
 import (
 	"errors"
+	"net/netip"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -20,31 +21,54 @@ func TestFilterProgramsVerify(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("cannot raise memlock (need privileges): %v", err)
 	}
+	// mgmt builds the WithKeepManagement exception set for a mixed-family host,
+	// so the verifier checks every generated block including the IPv6 paths.
+	mgmt := func(tcpPorts ...uint16) []Match {
+		if len(tcpPorts) == 0 {
+			tcpPorts = []uint16{22}
+		}
+		return managementExceptions([]netip.Prefix{
+			netip.MustParsePrefix("192.168.1.5/32"),
+			netip.MustParsePrefix("2001:db8::1/128"),
+		}, tcpPorts, false)
+	}
 	cases := []struct {
-		name    string
-		matches []Match
+		name       string
+		matches    []Match
+		exceptions []Match
 	}{
-		{"udp-two-ports", []Match{MatchUDPPort(4789, 51820)}},
-		{"udp-any", []Match{MatchUDPPort()}},
-		{"tcp-port", []Match{MatchTCPPort(443)}},
-		{"icmp-echo", []Match{MatchICMPEcho()}},
-		{"ip-proto-gre", []Match{MatchIPProto(47)}},
-		{"ethertype-arp", []Match{MatchEtherType(0x0806)}},
-		{"all", []Match{MatchAll()}},
-		{"none", []Match{MatchNone()}},
-		{"src-ip4", []Match{MatchSrcIP("10.0.0.0/8")}},
-		{"dst-ip4-host", []Match{MatchDstIP("192.168.1.5/32")}},
-		{"src-ip6", []Match{MatchSrcIP("2001:db8::/32")}},
-		{"dst-ip6-host", []Match{MatchDstIP("2001:db8::1/128")}},
-		{"ip-mixed", []Match{MatchSrcIP("10.0.0.0/8"), MatchDstIP("2001:db8::/48")}},
-		{"flow-v4", []Match{MatchFlow("10.0.0.1/32", "10.0.0.2/32")}},
-		{"flow-v6", []Match{MatchFlow("2001:db8::/32", "2001:db8:1::/48")}},
-		{"flow-both-dirs", []Match{MatchFlow("10.0.0.1/32", "10.0.0.2/32"), MatchFlow("10.0.0.2/32", "10.0.0.1/32")}},
-		{"composite", []Match{MatchUDPPort(4789, 51820), MatchICMPEcho(), MatchTCPPort(22), MatchSrcIP("172.16.0.0/12")}},
+		{"keep-management", []Match{MatchAll()}, mgmt()},
+		{"keep-management-extra-port", []Match{MatchAll()}, mgmt(22, 2222)},
+		{"keep-management-unscoped", []Match{MatchAll()}, managementExceptions(nil, []uint16{22}, true)},
+		{"keep-management-arp-nd-only", []Match{MatchAll()}, managementExceptions(nil, []uint16{22}, false)},
+		{"keep-management-dual-stack-2x2", []Match{MatchAll()}, managementExceptions([]netip.Prefix{
+			netip.MustParsePrefix("192.168.1.5/32"),
+			netip.MustParsePrefix("10.0.0.7/32"),
+			netip.MustParsePrefix("2001:db8::1/128"),
+			netip.MustParsePrefix("fd00::2/128"),
+		}, []uint16{22}, false)},
+		{"keep-management-with-filter", []Match{MatchUDPPort(4789), MatchICMPEcho()}, mgmt()},
+		{"udp-two-ports", []Match{MatchUDPPort(4789, 51820)}, nil},
+		{"udp-any", []Match{MatchUDPPort()}, nil},
+		{"tcp-port", []Match{MatchTCPPort(443)}, nil},
+		{"icmp-echo", []Match{MatchICMPEcho()}, nil},
+		{"ip-proto-gre", []Match{MatchIPProto(47)}, nil},
+		{"ethertype-arp", []Match{MatchEtherType(0x0806)}, nil},
+		{"all", []Match{MatchAll()}, nil},
+		{"none", []Match{MatchNone()}, nil},
+		{"src-ip4", []Match{MatchSrcIP("10.0.0.0/8")}, nil},
+		{"dst-ip4-host", []Match{MatchDstIP("192.168.1.5/32")}, nil},
+		{"src-ip6", []Match{MatchSrcIP("2001:db8::/32")}, nil},
+		{"dst-ip6-host", []Match{MatchDstIP("2001:db8::1/128")}, nil},
+		{"ip-mixed", []Match{MatchSrcIP("10.0.0.0/8"), MatchDstIP("2001:db8::/48")}, nil},
+		{"flow-v4", []Match{MatchFlow("10.0.0.1/32", "10.0.0.2/32")}, nil},
+		{"flow-v6", []Match{MatchFlow("2001:db8::/32", "2001:db8:1::/48")}, nil},
+		{"flow-both-dirs", []Match{MatchFlow("10.0.0.1/32", "10.0.0.2/32"), MatchFlow("10.0.0.2/32", "10.0.0.1/32")}, nil},
+		{"composite", []Match{MatchUDPPort(4789, 51820), MatchICMPEcho(), MatchTCPPort(22), MatchSrcIP("172.16.0.0/12")}, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			prog, err := newFilterProgram(4, tc.matches)
+			prog, err := newFilterProgram(4, tc.exceptions, tc.matches)
 			if err != nil {
 				var ve *ebpf.VerifierError
 				if errors.As(err, &ve) {
