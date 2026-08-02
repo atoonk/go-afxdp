@@ -1,0 +1,39 @@
+ena: fix XDP multi-buffer being silently disabled on recent kernels
+
+The ENA_HAVE_XDP_MB_DEPS compile probe tests for xdp_update_skb_shared_info(),
+which upstream Linux renamed to xdp_update_skb_frags_info(). On kernels that
+carry only the new name the probe fails, so ENA_HAVE_XDP_MB_DEPS and in turn
+ENA_XDP_MB_SUPPORT are never defined. ena_get_max_xdp_mtu() then falls into its
+"#ifndef ENA_XDP_MB_SUPPORT" branch and applies ENA_XDP_MAX_SINGLE_FRAME_SIZE
+(3502 bytes) unconditionally, so a program's BPF_F_XDP_HAS_FRAGS flag can no
+longer influence the MTU decision and XDP cannot attach at EC2's default MTU
+of 9001:
+
+  ena 0000:00:05.0 ens5: Failed to set xdp program, the current MTU (9001) is
+  larger than the maximum allowed MTU (3502) while xdp is on
+
+The driver body already uses the current name -- kcompat.h aliases
+xdp_update_skb_frags_info back to xdp_update_skb_shared_info when
+ENA_HAVE_XDP_FRAGS_INFO_AND_FLAGS is undefined, and the probe for that macro
+later in the same file already tests the new name. Only this aggregate
+dependency probe was missed.
+
+Drop the call rather than renaming it: the remaining symbols already establish
+multi-buffer capability, and renaming would break older kernels that carry only
+the old name.
+
+Reported upstream: https://github.com/amzn/amzn-drivers
+Verified on c7gn.xlarge, Amazon Linux 2023, kernel 6.18.38-76.139, ena 2.17.2g.
+
+diff --git a/kernel/linux/ena/config/test_defs.sh b/kernel/linux/ena/config/test_defs.sh
+index dbc13f5..62b6e76 100755
+--- a/kernel/linux/ena/config/test_defs.sh
++++ b/kernel/linux/ena/config/test_defs.sh
+@@ -170,7 +170,6 @@ try_compile_async "#include <net/xdp.h>
+                      xdp_get_shared_info_from_frame(NULL);
+                      xdp_buff_has_frags(NULL);
+                      xdp_frame_has_frags(NULL);
+-                     xdp_update_skb_shared_info(NULL, 0, 0, 0, false);
+                      xdp_buff_set_frags_flag(NULL);
+                      __xdp_rxq_info_reg(NULL, NULL, 0, 0, 0);
+                    }"                                                     \
