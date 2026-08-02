@@ -191,6 +191,54 @@ Measured box-wide on the receiver, 16 queues carried 116 Mpps using 19.5 of 48
 cores, while 48 queues carried 119 Mpps using 36.5 — nearly double the machine for
 2% more throughput.
 
+### NAPI batching (done for you)
+
+Left alone, the kernel wakes an AF_XDP receiver once per NAPI poll, and at these
+rates that is far too often — 5.7 million wakeups a second carrying 18 packets
+each. The receiver then burns its CPU on syscall entry and poll machinery instead
+of on packets: profiling the 48-queue sink put `os_xsave`, `sock_poll`,
+`eventfd_poll` and interrupt dispatch at the top, with the functions that actually
+move packets (`__xsk_map_redirect`, `__xsk_rcv_zc`) nowhere near it.
+
+**`Open` fixes this for you.** On a native-mode NIC it sets
+`napi_defer_hard_irqs=2` and `gro_flush_timeout=200µs` so the kernel lets packets
+accumulate, and restores your previous values on `Close`. Same traffic, same
+118.8 Mpps, on the 100G Mellanox sink:
+
+| | packets per poll | polls/s | box busy |
+| --- | --- | --- | --- |
+| kernel default | 18 | 5.7M | 36.5 of 48 cores |
+| what `Open` applies | 74 | 1.6M | **14.0 of 48 cores** |
+
+Same throughput for **less than half the machine**, which is why this is on by
+default rather than a tuning tip. `Fleet.Info()` reports it (`napi defer=2
+flush=200µs`) so it is never invisible.
+
+Worth knowing, since these are properties of the interface rather than of your
+process:
+
+- They are restored on `Close`, but **a crash leaves them applied**. To reset by
+  hand: `echo 0 > /sys/class/net/<iface>/napi_defer_hard_irqs` and the same for
+  `gro_flush_timeout`.
+- Deferring can hold a packet for up to the flush timeout when traffic is sparse,
+  so it trades a little idle latency for a lot of loaded throughput.
+- Generic/SKB mode is never touched, so veth and test setups are unaffected.
+- Opt out with `WithoutAutoTune()`, or change the values with
+  `WithNAPITuning(deferIRQs, flush)`. Do not raise them much: at `10` and `500µs`
+  the same sink fell to 77 Mpps with 29M discards a second, because NAPI stopped
+  running often enough.
+
+Interrupt coalescing (`ethtool -C rx-usecs`) does *not* substitute for this —
+most wakeups here are NAPI flushes rather than hardware interrupts, so raising
+`rx-usecs` changed nothing at all.
+
+One curiosity this explains: untuned, throughput becomes oddly sensitive to how
+long the XDP program takes, and a filter that reads packet headers batches better
+— and so runs *faster* — than one that does nothing. Tuned, that inversion
+disappears and the simplest program is the cheapest, as it should be.
+
+### Queue count
+
 Tune this on the NIC, not in the application. Reduce the channel count so RSS only
 spreads over the queues you want, and keep binding all of them (the default):
 
@@ -278,10 +326,52 @@ A few things to know. Matches combine with OR, a packet is redirected if it
 matches any of them. The one built-in AND is `MatchFlow`, which requires a src
 CIDR and a dst CIDR together; arbitrary AND across the other builders is not
 expressible as a single filter. The port, proto, and ICMP matchers
-are IPv4 only and assume no VLAN tag and no IP options, the common case; the IP
+are IPv4 only and assume no IP options, the common case; the IP
 (CIDR) matchers handle both IPv4 and IPv6 and read fixed offsets, so they are not
-bothered by IP options or IPv6 extension headers. For classification beyond these
-builders, redirect everything and classify in your receive loop.
+bothered by IP options or IPv6 extension headers. Every matcher transparently
+skips a single 802.1Q VLAN tag, so the same filter works whether or not the NIC
+strips the tag before XDP — stacked QinQ tags are not unwound. For classification
+beyond these builders, redirect everything and classify in your receive loop.
+
+### Not cutting off your own SSH
+
+`MatchAll()` on the NIC you are logged in through takes every packet away from the
+kernel, including the ones carrying your session. `WithKeepManagement()` leaves
+those with the kernel and captures the rest:
+
+```go
+fleet, err := afxdp.Open("eth0",
+    afxdp.WithFilter(afxdp.MatchAll()), // capture everything...
+    afxdp.WithKeepManagement(),         // ...except what keeps me logged in
+)
+```
+
+What stays with the kernel:
+
+| passed through | why |
+| --- | --- |
+| ARP, IPv6 ND (ICMPv6 133–137) | gateway MAC resolution |
+| TCP to/from port 22, addressed to this interface | inbound and outbound SSH |
+| UDP and TCP source port 53, addressed to this interface | DNS replies |
+
+**ARP matters more than the SSH rule.** Pass SSH through but swallow ARP and the
+box still goes dark: the kernel cannot refresh the gateway's link-layer address,
+and about a minute later it can no longer reply to anything. That is the failure
+this exists to prevent, and it is why the preset is not just "port 22".
+
+The port rules are scoped to the addresses the interface has when `Open` is
+called, so a router still captures transit traffic on port 22 — only traffic
+addressed to this box is spared. Every address is covered, IPv4 and IPv6, however
+many of each: a rule is emitted per address, and the address family selects the
+header offsets. Addresses added later are not covered; reopen the fleet if they
+change. Pass extra TCP ports for SSH on a non-standard port:
+`WithKeepManagement(2222)`.
+
+Two things to know. Traffic *from* port 22 or 53 to this host is not captured, so
+a sender that picks those source ports evades the capture — irrelevant for
+measurement, relevant if you are hunting an adversary. And if you administer the
+box through a different NIC than the one you are capturing on, you do not need
+this at all.
 
 ## Transmit
 
