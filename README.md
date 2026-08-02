@@ -428,6 +428,7 @@ Everything is configured with functional options on `Open`:
 | `WithRingSize(n)` | all four ring sizes, power of two (default 2048) |
 | `WithZeroCopy()` | require native zero copy, `Open` fails if unavailable |
 | `WithDriverMode()` / `WithGenericMode()` | force native / generic attach (default: auto) |
+| `WithMultiBuffer()` | let packets span several frames — jumbo support, costs zero copy |
 | `WithOptions(o)` | drop in a full `Options` struct, then override fields |
 
 By default `Open` picks the mode for you. It tries native zero copy, then native
@@ -481,44 +482,86 @@ If you use the high-level API, turn it on.
 ## AWS EC2 / ENA
 
 The `ena` driver (EC2, including the "network optimized" `*n`/`*gn` instances)
-supports native XDP, but only under two conditions — miss either and `Open`
-silently falls back to **generic** XDP, which works but drops packets on the
-floor under load without any counter showing it. `Fleet.Info()` tells you which
-mode you got; if it says `generic` on ENA, fix these two things:
+supports native XDP, but the MTU has to be right, and on driver versions before
+2.17.0 the channel count too. Miss either and `Open` silently falls back to
+**generic** XDP, which works but drops packets on the floor under load without
+any counter showing it. `Fleet.Info()` tells you which mode you got; if it says
+`generic` on ENA, check these:
 
-1. **Free up queues for XDP.** Native XDP needs a dedicated transmit ring per
-   channel, carved out of the same fixed hardware queue budget as your normal
-   channels. ENA refuses native attach unless channels are **≤ half** the
-   maximum. EC2 gives you roughly one queue per vCPU, so on a 4-vCPU instance
-   with 4 channels you must halve it:
-   ```
-   ethtool -L ens5 combined 2
-   ```
-   (This is not something the library can avoid — the kernel XDP API has no way
-   to declare "this program never transmits", so the driver reserves TX rings
-   regardless. go-afxdp only ever redirects or passes, never `XDP_TX`, but ENA
-   still requires the headroom.)
-
-2. **Lower the MTU.** Base XDP hands the program one contiguous, page-sized
+1. **Lower the MTU.** Base XDP hands the program one contiguous, page-sized
    (4 KB) buffer per packet, so a 9001-byte jumbo frame doesn't fit and ENA
    rejects the attach. Set the MTU under ~3.5 KB:
    ```
    ip link set dev ens5 mtu 3000
    ```
    (EC2 defaults to jumbo 9001. This is the driver's single-buffer XDP limit,
-   not a library choice; ENA has not yet implemented XDP multi-buffer.)
+   not a library choice.) If you actually need jumbo frames, `WithMultiBuffer()`
+   plus the driver patch in [contrib/ena-jumbo/](contrib/ena-jumbo/) lifts this —
+   at the cost of zero-copy, so lowering the MTU stays the faster option
+   otherwise.
+
+2. **Only on ENA older than 2.17.0: free up queues for XDP.** Those versions
+   carved a dedicated transmit ring per channel out of the same fixed hardware
+   queue budget as your normal channels, and refused a native attach unless
+   channels were **≤ half** the maximum. ENA 2.17.0 added full queue
+   utilization in XDP and the limit is gone: measured on 2.17.2g, full channels
+   (4 of 4) give native zero-copy for both receive and transmit. Check your
+   version first, and only halve the channels if it is below 2.17.0:
+   ```
+   ethtool -i ens5 | grep '^version'
+   ethtool -L ens5 combined 2
+   ```
 
 **Zero copy** on ENA additionally needs page-sized (4096-byte) UMEM frames — with
 the default 2048 the bind silently drops to native *copy* mode. Open handles this
-for you: when it sees the `ena` driver it defaults `FrameSize` to 4096, so with
-the two settings above the banner reads `zero-copy, native XDP` with no code
+for you: when it sees the `ena` driver it defaults `FrameSize` to 4096, so once
+the MTU is right the banner reads `zero-copy, native XDP` with no code
 change. (Pass `WithFrameSize` yourself only to override that. It costs twice the
 UMEM per queue, which is why 4096 is an ena-only default, not the global one.)
 
-Both `ethtool`/`ip` settings are per-boot; re-apply after a reboot. They are NIC
+These `ethtool`/`ip` settings are per-boot; re-apply after a reboot. They are NIC
 config, so set them yourself rather than have the library reconfigure your
 interface underneath you. (The frame-size default is the one thing the library
 *can* safely pick for you, since it only changes its own UMEM, not your NIC.)
+
+### Jumbo frames (multi-buffer)
+
+By default a packet must fit one UMEM frame, which is what forces the MTU step
+above. `WithMultiBuffer()` lets a packet span several frames instead: it loads
+the XDP program with `BPF_F_XDP_HAS_FRAGS` (so it can attach at a jumbo MTU at
+all) and binds the socket with `XDP_USE_SG` (without which the kernel silently
+drops every multi-buffer packet).
+
+Read chained packets with `ReceivePackets` rather than `Receive` — `Receive`
+returns one `Desc` per *frame*, so a jumbo packet looks like several unrelated
+descriptors. `SendBatch` splits oversized payloads for you.
+
+```go
+fleet, _ := afxdp.Open("ens5",
+    afxdp.WithFilter(afxdp.MatchUDPPort(4789)),
+    afxdp.WithMultiBuffer(),
+)
+xsk := fleet.Sockets()[0]
+
+pkts := xsk.ReceivePackets(64)      // []Packet, each a []Desc in wire order
+for _, p := range pkts {
+    n := xsk.CopyOut(p, buf)        // or walk p's fragments to avoid the copy
+    _ = buf[:n]
+}
+xsk.RecyclePackets(pkts)
+```
+
+**The trade-off:** a device reports its multi-buffer zero-copy limit as
+`xdp-zc-max-segs`. Where that is 1 — which is every ENA today — the kernel
+refuses an `XDP_USE_SG` bind in zero-copy mode, so `Open` settles for native
+*copy*. On ENA you get jumbo **or** zero-copy, never both. Native copy still
+beats the generic fallback comfortably, but if you don't need jumbo frames,
+lowering the MTU and leaving this option off is faster. Check `Info().ZeroCopy`.
+
+**On AWS this needs a driver patch.** A stale compile probe in the ENA driver
+disables multi-buffer on current kernels, so XDP still won't attach at MTU 9001
+no matter what this library does. A one-line fix, the reasoning behind it, and
+step-by-step instructions are in [contrib/ena-jumbo/](contrib/ena-jumbo/).
 
 Measured on two `c7gn.xlarge` (4 vCPU, 6.1 kernel, `blast` → `drop`, 64-byte
 frames), showing why the mode matters:
