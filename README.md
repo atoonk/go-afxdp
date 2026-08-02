@@ -563,25 +563,39 @@ disables multi-buffer on current kernels, so XDP still won't attach at MTU 9001
 no matter what this library does. A one-line fix, the reasoning behind it, and
 step-by-step instructions are in [contrib/ena-jumbo/](contrib/ena-jumbo/).
 
-Measured on two `c7gn.xlarge` (4 vCPU, 6.1 kernel, `blast` → `drop`, 64-byte
-frames), showing why the mode matters:
+Measured on two `c7gn.xlarge` (4 vCPU, kernel 6.18, ena 2.17.2g, `blast` → `drop`
+over the private subnet, 64-byte frames), showing why the mode matters:
 
-| Receiver mode | Result |
-|---------------|--------|
-| generic XDP (default) | ~3.1M rx pps — silently loses ~25% of a 4M pps sender |
-| native XDP (queues + MTU) | lossless, rx == tx, `nic=0 app=0` |
-| native + zero copy (auto 4096 frames) | 5.0M pps flat |
+| Receiver mode | MTU | rx pps | CPU per packet |
+|---------------|-----|--------|----------------|
+| generic XDP (no setup) | 9001 | 4.89M, ~2% loss | — |
+| native, copy (`WithMultiBuffer`) | 9001 | 4.29M | 0.375 µs |
+| native, copy (`WithMultiBuffer`) | 3000 | 4.96M | 0.349 µs |
+| native + zero copy (auto 4096 frames) | 3000 | **5.00M**, 0.16% loss | 0.280 µs |
 
-With everything in place — halved channels, MTU ≤ 3502, and the auto-4096 frames
-giving a `zero-copy, native XDP` banner — `blast → drop` runs a **clean, steady
-5.0M pps** end to end, lossless (`nic=0 app=0` on the receiver). That was the
-number on this instance type in our testing.
+With the MTU set and the auto-4096 frames giving a `zero-copy, native XDP`
+banner, `blast → drop` runs a **clean, steady 5.0M pps** end to end.
 
-At that point the ceiling is the instance, not the library: AWS's Nitro network
-layer **polices packets-per-second**, so past the instance's allowance (~5M pps
-on `c7gn.xlarge`) the `pps_allowance_exceeded` counter in `ethtool -S ens5`
-climbs and the rate flat-lines there regardless of queues or cores. Bigger
-instances raise the allowance.
+Three things that table will mislead you about if you read it too quickly:
+
+- **The ceiling is the instance, not the library.** AWS's Nitro network layer
+  **polices packets-per-second**, so past the instance's allowance (~5M pps on
+  `c7gn.xlarge`) the `pps_allowance_exceeded` counter in `ethtool -S ens5`
+  climbs and the rate flat-lines there regardless of queues, cores or mode.
+  Bigger instances raise the allowance.
+- **Copy and zero copy therefore look closer than they are.** They reach nearly
+  the same pps here only because the allowance binds first. The real difference
+  is CPU: copy costs about 1.25× per packet at 64 bytes and 1.76× at 1400 bytes,
+  where there is more to copy. That matters when you are CPU-bound, which on
+  this instance size you are not.
+- **The jumbo MTU costs about 13% pps by itself** (4.29M vs 4.96M, same mode).
+  If you turn on `WithMultiBuffer()` but do not actually need jumbo frames, you
+  pay that for nothing.
+
+Also worth knowing: **generic used to be far worse**. On a 6.1 kernel this same
+test lost roughly 25% of a 4M pps sender. On 6.18 it loses about 2%. Still worth
+avoiding, since it drops packets where native does not and cannot do zero copy,
+but the old figure no longer describes it.
 
 ## Examples
 
@@ -748,10 +762,10 @@ AF_XDP needs `CAP_NET_RAW` (or root) and enough locked memory for the BPF maps a
 UMEM (raise `RLIMIT_MEMLOCK`, e.g. `ulimit -l`). `Open` picks native zero copy
 when the driver supports it and otherwise falls back automatically, so you do not
 have to, and `Fleet.Info()` shows what you got. On AWS ENA, zero copy additionally
-needs page-sized frames (Open defaults `FrameSize` to 4096 there automatically),
-halved channels, and a non-jumbo MTU (the driver caps XDP MTU at 3502, so e.g.
-`ethtool -L ens5 combined 2 && ip link set ens5 mtu 1500`) — see the AWS EC2 / ENA
-section.
+needs page-sized frames (Open defaults `FrameSize` to 4096 there automatically)
+and a non-jumbo MTU, since the driver caps XDP MTU at 3502 (`ip link set ens5 mtu
+1500`). Driver versions before 2.17.0 also need halved channels. See the AWS EC2 /
+ENA section.
 
 ## Credits and license
 
