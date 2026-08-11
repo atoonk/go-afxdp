@@ -128,7 +128,8 @@ type Socket struct {
 	statKicksSuppressed atomic.Uint64
 
 	// Receive-path syscall accounting, same rationale as the kick counters.
-	statPolls atomic.Uint64
+	statPolls   atomic.Uint64
+	statRxKicks atomic.Uint64
 
 	// Stats-side state: the kernel's ring indices are 32-bit and wrap every
 	// 2^32 packets (~5 minutes at 10G line rate), so Stats extends them to
@@ -700,6 +701,41 @@ func (xsk *Socket) Kick() error {
 	}
 }
 
+// WakeupRx is Kick's receive-side twin: it wakes a driver that has parked
+// with the fill-ring NEED_WAKEUP flag set, so it resumes posting the
+// descriptors a preceding Fill made available. Poll performs this wakeup as a
+// side effect, which hides the contract from callers that block; a caller
+// that drives the rings directly (Fill without ever blocking in Poll) MUST
+// call this after refilling whenever NeedsWakeupRx reports true, or the newly
+// filled descriptors sit unposted until its next idle Poll -- the NIC then
+// drops arriving packets for want of RX descriptors (rx_out_of_buffer) while
+// the fill ring is provably full. Measured on a 48-core mlx5 router: the
+// workers' idle-poll rate became the descriptor-posting clock, capping
+// delivery at ~5.5M pps with the box two-thirds idle.
+//
+// The syscall is a zero-length non-blocking recvfrom, the canonical XSK RX
+// wakeup. Call only when NeedsWakeupRx is true; the flag check is one atomic
+// load, so the syscall is paid only when the driver is actually parked.
+func (xsk *Socket) WakeupRx() error {
+	if !xsk.incref() {
+		return net.ErrClosed
+	}
+	defer xsk.decref()
+	xsk.statRxKicks.Add(1)
+	for {
+		_, _, errno := unix.Syscall6(unix.SYS_RECVFROM, uintptr(xsk.fd),
+			0, 0, uintptr(unix.MSG_DONTWAIT), 0, 0)
+		switch errno {
+		case 0, unix.EAGAIN: // EWOULDBLOCK == EAGAIN on Linux
+			return nil // woken; EAGAIN just means "nothing to read", which is fine
+		case unix.EINTR:
+			continue
+		default:
+			return fmt.Errorf("afxdp: recvfrom rx wakeup: %w", errno)
+		}
+	}
+}
+
 // Complete reclaims up to n transmitted frames from the completion ring and
 // returns them to the transmit pool, making them available to Alloc again.
 // It returns how many frames were reclaimed.
@@ -854,7 +890,10 @@ type Stats struct {
 	// your receive loop is batching: a healthy loaded queue reads in the
 	// dozens or hundreds, while a value near 1 means you are paying a syscall
 	// per packet and should drain more per wakeup.
-	Polls       uint64
+	Polls uint64
+	// RxKicks counts WakeupRx syscalls: explicit fill-ring wakeups issued by a
+	// caller driving the rings directly instead of blocking in Poll.
+	RxKicks     uint64
 	KernelStats unix.XDPStatistics
 }
 
@@ -916,6 +955,7 @@ func (xsk *Socket) Stats() (Stats, error) {
 	s.Kicks = xsk.statKicks.Load()
 	s.KicksSuppressed = xsk.statKicksSuppressed.Load()
 	s.Polls = xsk.statPolls.Load()
+	s.RxKicks = xsk.statRxKicks.Load()
 	size := uint64(unsafe.Sizeof(s.KernelStats))
 	if rc, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_STATISTICS,
