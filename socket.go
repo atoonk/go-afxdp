@@ -131,6 +131,17 @@ type Socket struct {
 	statPolls   atomic.Uint64
 	statRxKicks atomic.Uint64
 
+	// Transmit-path submission accounting (SendFunc), for localizing where a
+	// TX rate is lost: requested vs granted separates "caller asked for N" from
+	// "the ring/pool only had M"; ringFull counts full-ring early returns;
+	// submitted is what Transmit actually queued; inflightHW is the peak
+	// not-yet-completed depth. All written on the single transmit goroutine.
+	statSendReq   atomic.Uint64
+	statSendGot   atomic.Uint64
+	statRingFull  atomic.Uint64
+	statSubmitted atomic.Uint64
+	statInflightHW atomic.Uint64
+
 	// Stats-side state: the kernel's ring indices are 32-bit and wrap every
 	// 2^32 packets (~5 minutes at 10G line rate), so Stats extends them to
 	// 64-bit here. Guarded by statsMu — only the Stats path takes it, the
@@ -864,9 +875,14 @@ func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) (int
 		return 0, net.ErrClosed
 	}
 	defer xsk.decref()
+	xsk.statSendReq.Add(uint64(count))
 	xsk.Complete(xsk.NumCompleted()) // reclaim already-sent frames
+	if n := uint64(xsk.numTransmitted); n > xsk.statInflightHW.Load() {
+		xsk.statInflightHW.Store(n)
+	}
 	free := xsk.NumFreeTxSlots()
 	if free == 0 {
+		xsk.statRingFull.Add(1)
 		// Ring full: kick so the kernel drains it (in copy mode it won't on its
 		// own) and produces completions for the next call to reclaim.
 		if xsk.kickNeeded() {
@@ -880,6 +896,7 @@ func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) (int
 		count = free
 	}
 	descs := xsk.Alloc(count) // never more than free ring slots, so all transmit
+	xsk.statSendGot.Add(uint64(len(descs)))
 	for i := range descs {
 		frame := xsk.GetFrame(descs[i])
 		n := build(i, frame)
@@ -894,7 +911,9 @@ func (xsk *Socket) SendFunc(count int, build func(i int, frame []byte) int) (int
 		}
 		descs[i].Len = uint32(n)
 	}
-	return xsk.Transmit(descs), nil
+	sub := xsk.Transmit(descs)
+	xsk.statSubmitted.Add(uint64(sub))
+	return sub, nil
 }
 
 // Stats holds cumulative counters for a Socket. KernelStats carries the
@@ -915,8 +934,13 @@ type Stats struct {
 	Polls uint64
 	// RxKicks counts WakeupRx syscalls: explicit fill-ring wakeups issued by a
 	// caller driving the rings directly instead of blocking in Poll.
-	RxKicks     uint64
-	KernelStats unix.XDPStatistics
+	RxKicks uint64
+	// TX submission accounting (SendFunc). SendReq = packets the caller asked
+	// to send; SendGot = descriptors actually reserved (< SendReq when the ring
+	// or tx-frame pool was short); Submitted = descriptors Transmit queued;
+	// RingFull = full-ring early returns; InflightHW = peak un-completed depth.
+	SendReq, SendGot, Submitted, RingFull, InflightHW uint64
+	KernelStats                                       unix.XDPStatistics
 }
 
 // PacketsPerPoll returns how many frames were received per blocking poll(2) on
@@ -978,6 +1002,11 @@ func (xsk *Socket) Stats() (Stats, error) {
 	s.KicksSuppressed = xsk.statKicksSuppressed.Load()
 	s.Polls = xsk.statPolls.Load()
 	s.RxKicks = xsk.statRxKicks.Load()
+	s.SendReq = xsk.statSendReq.Load()
+	s.SendGot = xsk.statSendGot.Load()
+	s.Submitted = xsk.statSubmitted.Load()
+	s.RingFull = xsk.statRingFull.Load()
+	s.InflightHW = xsk.statInflightHW.Load()
 	size := uint64(unsafe.Sizeof(s.KernelStats))
 	if rc, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(xsk.fd),
 		unix.SOL_XDP, unix.XDP_STATISTICS,
