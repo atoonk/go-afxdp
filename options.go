@@ -59,6 +59,19 @@ type Options struct {
 	// unix.XDP_COPY to force copy mode, 0 to let the kernel choose. Default 0.
 	BindFlags uint16
 
+	// BusyPollUsecs/BusyPollBudget enable XSK preferred busy polling
+	// (SO_PREFER_BUSY_POLL, kernel 5.11+): the application's own poll and
+	// recvfrom syscalls drive NAPI directly with up to BusyPollBudget
+	// descriptors per call, decoupling RX descriptor posting from the
+	// interrupt rate. Without it a driver posts XSK descriptors only during
+	// interrupt-clocked NAPI cycles (budget 64), which caps per-queue
+	// delivery at 64 x the moderated interrupt rate no matter how fast
+	// userspace drains (measured: exactly 128k pps/queue on mlx5).
+	// Effective only alongside the per-device sysctls napi_defer_hard_irqs
+	// and gro_flush_timeout. Zero values leave busy polling off.
+	BusyPollUsecs  int
+	BusyPollBudget int
+
 	// XDPFlags are passed when the BPF program is attached to the link.
 	// Useful values: unix.XDP_FLAGS_DRV_MODE (native driver XDP),
 	// unix.XDP_FLAGS_SKB_MODE (generic, works everywhere but slow),
@@ -278,6 +291,15 @@ func WithGenericMode() Option { return func(c *config) { c.mode = modeGeneric } 
 // that drive the rings themselves rather than through Poll/Kick.
 func WithNeedWakeup() Option {
 	return func(c *config) { c.opts.BindFlags |= unix.XDP_USE_NEED_WAKEUP }
+}
+
+// WithBusyPoll enables XSK preferred busy polling (see
+// SocketOptions.BusyPollUsecs). usecs is the SO_BUSY_POLL duration, budget the
+// per-syscall descriptor budget (the kernel caps it at 512; 256 is a sensible
+// start). Pair with WithNeedWakeup: the need-wakeup flag is what tells the
+// caller its next syscall must drive NAPI.
+func WithBusyPoll(usecs, budget int) Option {
+	return func(c *config) { c.opts.BusyPollUsecs = usecs; c.opts.BusyPollBudget = budget }
 }
 
 // WithMultiBuffer enables multi-buffer (scatter-gather) mode, which lets a

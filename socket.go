@@ -374,6 +374,28 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 		return nil, fmt.Errorf("afxdp: bind queue %d: %w", queueID, err)
 	}
 
+	if opts.BusyPollUsecs > 0 && opts.BusyPollBudget > 0 {
+		// Raw values (not yet in x/sys): include/uapi/asm-generic/socket.h.
+		const (
+			soBusyPoll       = 46 // SO_BUSY_POLL
+			soPreferBusyPoll = 69 // SO_PREFER_BUSY_POLL (5.11+)
+			soBusyPollBudget = 70 // SO_BUSY_POLL_BUDGET (5.11+)
+		)
+		// Order matters on some kernels: prefer flag first, then knobs.
+		if err := unix.SetsockoptInt(xsk.fd, unix.SOL_SOCKET, soPreferBusyPoll, 1); err != nil {
+			xsk.Close()
+			return nil, fmt.Errorf("afxdp: SO_PREFER_BUSY_POLL (kernel < 5.11?): %w", err)
+		}
+		if err := unix.SetsockoptInt(xsk.fd, unix.SOL_SOCKET, soBusyPoll, opts.BusyPollUsecs); err != nil {
+			xsk.Close()
+			return nil, fmt.Errorf("afxdp: SO_BUSY_POLL: %w", err)
+		}
+		if err := unix.SetsockoptInt(xsk.fd, unix.SOL_SOCKET, soBusyPollBudget, opts.BusyPollBudget); err != nil {
+			xsk.Close()
+			return nil, fmt.Errorf("afxdp: SO_BUSY_POLL_BUDGET: %w", err)
+		}
+	}
+
 	return xsk, nil
 }
 
