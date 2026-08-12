@@ -59,6 +59,11 @@ type Options struct {
 	// unix.XDP_COPY to force copy mode, 0 to let the kernel choose. Default 0.
 	BindFlags uint16
 
+	// TxReuseRxFrames routes completions by address region (rx frames back to the
+	// rx pool) so received frames can be transmitted in place. Requires a
+	// single goroutine driving both sides of the socket; see WithTxReuseRxFrames.
+	TxReuseRxFrames bool
+
 	// BusyPollUsecs/BusyPollBudget enable XSK preferred busy polling
 	// (SO_PREFER_BUSY_POLL, kernel 5.11+): the application's own poll and
 	// recvfrom syscalls drive NAPI directly with up to BusyPollBudget
@@ -291,6 +296,22 @@ func WithGenericMode() Option { return func(c *config) { c.mode = modeGeneric } 
 // that drive the rings themselves rather than through Poll/Kick.
 func WithNeedWakeup() Option {
 	return func(c *config) { c.opts.BindFlags |= unix.XDP_USE_NEED_WAKEUP }
+}
+
+// WithTxReuseRxFrames allows transmitting RECEIVE-pool frames in place: Complete
+// routes each completed frame back to the pool its address belongs to (rx
+// region or tx region) instead of pushing everything to the transmit pool.
+// That makes forward-in-place legal: Receive a frame, rewrite it, Transmit
+// the same descriptor, and on completion the frame returns to the receive
+// pool for the fill ring — no copy, no pool imbalance.
+//
+// It changes the concurrency contract: without it, the rx pool is touched
+// only by the receive side and the tx pool only by the transmit side (the
+// lock-free 1RX+1TX split). With it, Complete — which runs on the transmit
+// side — may push to the rx pool. Use it only when ONE goroutine drives both
+// sides of the socket (the router/forwarder shape).
+func WithTxReuseRxFrames() Option {
+	return func(c *config) { c.opts.TxReuseRxFrames = true }
 }
 
 // WithBusyPoll enables XSK preferred busy polling (see

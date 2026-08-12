@@ -429,6 +429,7 @@ Everything is configured with functional options on `Open`:
 | `WithZeroCopy()` | require native zero copy, `Open` fails if unavailable |
 | `WithDriverMode()` / `WithGenericMode()` | force native / generic attach (default: auto) |
 | `WithMultiBuffer()` | let packets span several frames — jumbo support, costs zero copy |
+| `WithTxReuseRxFrames()` | let a forwarder transmit the frame it received, no copy (see below) |
 | `WithOptions(o)` | drop in a full `Options` struct, then override fields |
 
 By default `Open` picks the mode for you. It tries native zero copy, then native
@@ -450,6 +451,40 @@ reset the link, which is handy for quick local tests.
 Open already applies it on AWS ENA (see below), so you rarely set it by hand.
 Each socket has its own UMEM of `NumFrames * FrameSize` bytes, so memory scales
 with the queue count; size `NumFrames` accordingly on many-queue NICs.
+
+### Zero-copy forwarding: `WithTxReuseRxFrames`
+
+By default the receive and transmit frame pools are disjoint, which is what
+lets one receive goroutine and one transmit goroutine run without locking. The
+catch: a router that receives a packet and wants to send it back out has to
+copy it from an rx frame into a tx frame, because you can only transmit tx-pool
+frames.
+
+`WithTxReuseRxFrames()` removes that copy. It makes `Complete` return each
+finished frame to the pool its address belongs to (an rx frame goes back to the
+rx pool) instead of always the tx pool, so you can `Receive` a frame, rewrite
+it in place, `Transmit` the same descriptor, and on completion it flows back to
+the fill ring — no copy either direction.
+
+The tradeoff: `Complete` runs on the transmit side and may now touch the rx
+pool, so it is only safe when **one goroutine drives both sides** of the socket
+(the forwarder shape — receive, process, transmit in one loop). That is the
+common router layout, but it is not the default because it relaxes the
+lock-free split. It also can't combine with `WithMultiBuffer()` (`Open` refuses
+the pair): the completion routing recovers a frame's pool from its address with
+aligned-chunk arithmetic that assumes one frame per packet.
+
+```go
+xsk, _ := afxdp.Open("eth0", afxdp.WithTxReuseRxFrames())
+for {
+    xsk.Fill(xsk.NumFreeFillSlots())
+    for _, d := range xsk.Receive(64) {
+        rewrite(xsk.GetFrame(d))   // edit the packet in place
+        xsk.Transmit([]afxdp.Desc{d})
+    }
+    xsk.Complete(xsk.NumCompleted())
+}
+```
 
 ### Need Wakeup
 

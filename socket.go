@@ -198,6 +198,13 @@ func NewSocket(ifindex, queueID int, options *Options) (*Socket, error) {
 	if opts.TxFrames <= 0 || opts.TxFrames >= opts.NumFrames {
 		return nil, fmt.Errorf("afxdp: TxFrames must be in (0, NumFrames), got %d of %d", opts.TxFrames, opts.NumFrames)
 	}
+	if opts.TxReuseRxFrames && opts.BindFlags&unix.XDP_USE_SG != 0 {
+		// Completion routing recovers a frame's pool from its address with
+		// aligned-chunk arithmetic on a single frame per packet. Multi-buffer
+		// packets span several frames per descriptor chain, which that math
+		// does not cover; refuse loudly rather than corrupt pool accounting.
+		return nil, fmt.Errorf("afxdp: TxReuseRxFrames is incompatible with multi-buffer (XDP_USE_SG) sockets")
+	}
 	for name, v := range map[string]int{
 		"FillRingNumDescs":       opts.FillRingNumDescs,
 		"CompletionRingNumDescs": opts.CompletionRingNumDescs,
@@ -436,6 +443,16 @@ func (xsk *Socket) UMEM() []byte { return xsk.umem }
 // the stride for interpreting UMEM() frame-by-frame.
 func (xsk *Socket) FrameSize() int { return xsk.options.FrameSize }
 
+// frameBase recovers a frame's base address from any address within it.
+//
+// PRECONDITION: this modulo arithmetic is only correct because the UMEM is
+// registered with ALIGNED chunks (this library never sets
+// XDP_UMEM_UNALIGNED_CHUNK_FLAG): a packet's bytes always live inside one
+// FrameSize-aligned chunk, so base = addr - addr%FrameSize is exact. The
+// TxReuseRxFrames completion routing depends on this. If unaligned-chunk
+// support is ever added, descriptor addresses become base|offset encodings
+// (XSK_UNALIGNED_BUF_OFFSET_SHIFT) and this function must be rewritten
+// before that mode may combine with TxReuseRxFrames.
 func (xsk *Socket) frameBase(addr uint64) uint64 {
 	return addr - (addr % uint64(xsk.options.FrameSize))
 }
@@ -772,6 +789,10 @@ func (xsk *Socket) WakeupRx() error {
 // Complete reclaims up to n transmitted frames from the completion ring and
 // returns them to the transmit pool, making them available to Alloc again.
 // It returns how many frames were reclaimed.
+//
+// In hairpin mode (WithTxReuseRxFrames) each frame instead returns to the pool its
+// address belongs to, so a receive-pool frame that was transmitted in place
+// becomes fill-ring-eligible again rather than leaking into the tx pool.
 func (xsk *Socket) Complete(n int) int {
 	if !xsk.incref() {
 		return 0
@@ -783,10 +804,23 @@ func (xsk *Socket) Complete(n int) int {
 	}
 	cons := ldIdx(xsk.completionRing.Consumer)
 	mask := uint32(xsk.options.CompletionRingNumDescs - 1)
-	for i := 0; i < n; i++ {
-		addr := xsk.completionRing.Descs[cons&mask]
-		cons++
-		xsk.txPool.push(xsk.frameBase(addr))
+	if xsk.options.TxReuseRxFrames {
+		txStart := uint64(xsk.options.NumFrames-xsk.options.TxFrames) * uint64(xsk.options.FrameSize)
+		for i := 0; i < n; i++ {
+			addr := xsk.completionRing.Descs[cons&mask]
+			cons++
+			if base := xsk.frameBase(addr); base < txStart {
+				xsk.rxPool.push(base)
+			} else {
+				xsk.txPool.push(base)
+			}
+		}
+	} else {
+		for i := 0; i < n; i++ {
+			addr := xsk.completionRing.Descs[cons&mask]
+			cons++
+			xsk.txPool.push(xsk.frameBase(addr))
+		}
 	}
 	stIdx(xsk.completionRing.Consumer, cons) // release: kernel may reuse these slots now
 	xsk.numTransmitted -= n
