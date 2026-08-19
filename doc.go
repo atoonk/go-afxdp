@@ -101,11 +101,27 @@ all configured with functional options:
 A filter is required: without one Open would redirect every packet to your
 sockets and starve the kernel (an easy way to cut off your own SSH), so it
 returns an error instead. WithUDPPorts (or the more general WithFilter, which
-composes Match builders like MatchUDPPort, MatchTCPPort, MatchICMPEcho,
-MatchIPProto, MatchSrcIP, MatchDstIP, MatchFlow, MatchEtherType) redirects only matching packets and passes
+composes Match builders like MatchUDPPort, MatchTCPPort, MatchICMPv4Echo,
+MatchIPv4Proto, MatchSrcIP, MatchDstIP, MatchFlow, MatchEtherType) redirects only matching packets and passes
 everything else to the normal kernel stack — so you can run on a live interface
 safely. Use WithFilter(MatchAll()) to deliberately take everything, or
-WithFilter(MatchNone()) for transmit-only.
+WithFilter(MatchNone()) for transmit-only. If none of the builders express what
+you need, the bpfmatch module matches what a classic-BPF (tcpdump) program
+matches, and NewMatch below it lets you supply raw eBPF. MatchPacket runs a filter
+against a packet you supply, so you can unit-test either without a NIC.
+
+Expression strings ("tcp port 22 and not src host 192.0.2.1") need libpcap and
+so live in a separate module, github.com/atoonk/go-afxdp/pcapfilter; this
+module stays pure Go.
+
+Note that go-afxdp's public API includes types from github.com/cilium/ebpf:
+NewMatch's builder returns asm.Instructions and Program embeds an
+*ebpf.Program, so a major-version change there would be a breaking change here.
+
+The cBPF layer lives in the separate module github.com/atoonk/go-afxdp/bpfmatch
+and filter expressions in github.com/atoonk/go-afxdp/pcapfilter, so the
+compiler they need — and, for pcapfilter, libpcap and cgo — stay out of this
+module entirely.
 
 If you do take everything on the NIC you administer the box through, add
 WithKeepManagement: it leaves ARP, IPv6 neighbour discovery, SSH and DNS replies

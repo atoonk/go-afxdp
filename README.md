@@ -272,7 +272,7 @@ redirected if it satisfies **any** of them (logical OR):
 // WireGuard on two ports, plus let ping through:
 afxdp.Open("eth0", afxdp.WithFilter(
     afxdp.MatchUDPPort(51820, 51821),
-    afxdp.MatchICMPEcho(),
+    afxdp.MatchICMPv4Echo(),
 ))
 
 // A VXLAN tunnel endpoint and its BGP session:
@@ -281,11 +281,30 @@ afxdp.Open("eth0", afxdp.WithFilter(
     afxdp.MatchTCPPort(179),
 ))
 
-// All GRE and all ESP (IPsec), regardless of ports:
+// Replies rather than requests — match the source port:
 afxdp.Open("eth0", afxdp.WithFilter(
-    afxdp.MatchIPProto(47),
-    afxdp.MatchIPProto(50),
+    afxdp.MatchUDPSrcPort(53),  // DNS answers
+    afxdp.MatchTCPSrcPort(443), // TLS server -> client
 ))
+
+// All GRE and all ESP (IPsec), regardless of ports. The protocol matchers are
+// per-family, because IPv6 Next Header is not the same question as the IPv4
+// protocol field — see the note below:
+afxdp.Open("eth0", afxdp.WithFilter(
+    afxdp.MatchIPv4Proto(47),      // GRE over IPv4
+    afxdp.MatchIPv6NextHeader(47), // GRE over IPv6
+    afxdp.MatchIPv4Proto(50),      // ESP over IPv4
+))
+
+// Ping, both families:
+afxdp.Open("eth0", afxdp.WithFilter(
+    afxdp.MatchICMPv4Echo(),
+    afxdp.MatchICMPv6Echo(),
+))
+
+// A whole address family, by EtherType:
+afxdp.Open("eth0", afxdp.WithFilter(afxdp.MatchEtherType(afxdp.EtherTypeIPv6)))
+afxdp.Open("eth0", afxdp.WithFilter(afxdp.MatchEtherType(afxdp.EtherTypeARP)))
 
 // Anything to or from a subnet, by CIDR (IPv4 or IPv6):
 afxdp.Open("eth0", afxdp.WithFilter(
@@ -293,6 +312,12 @@ afxdp.Open("eth0", afxdp.WithFilter(
     afxdp.MatchDstIP("10.0.0.0/8"),
 ))
 afxdp.Open("eth0", afxdp.WithFilter(afxdp.MatchDstIP("2001:db8::/32")))
+
+// Everything except one noisy host — exceptions win over the filter:
+afxdp.Open("eth0",
+    afxdp.WithFilter(afxdp.MatchAll()),
+    afxdp.WithExcept(afxdp.MatchSrcIP("192.0.2.10/32")),
+)
 
 // One flow, src AND dst (both directions, OR the two halves):
 afxdp.Open("eth0", afxdp.WithFilter(
@@ -305,10 +330,13 @@ Match builders:
 
 | Builder | Matches |
 |---------|---------|
-| `MatchUDPPort(ports...)` | IPv4/UDP to these dest ports (no ports = all UDP) |
-| `MatchTCPPort(ports...)` | IPv4/TCP to these dest ports (no ports = all TCP) |
-| `MatchICMPEcho()` | IPv4 ICMP echo request (ping) |
-| `MatchIPProto(proto)` | any IPv4 with this protocol number (47 GRE, 50 ESP, ...) |
+| `MatchUDPPort(ports...)` | UDP to these dest ports, IPv4 **and** IPv6 (no ports = all UDP) |
+| `MatchUDPSrcPort(ports...)` | UDP from these source ports — replies rather than requests |
+| `MatchTCPPort(ports...)` | TCP to these dest ports, IPv4 **and** IPv6 (no ports = all TCP) |
+| `MatchTCPSrcPort(ports...)` | TCP from these source ports |
+| `MatchIPv4Proto(proto)` | IPv4 with this protocol number (47 GRE, 50 ESP, ...) |
+| `MatchIPv6NextHeader(nh)` | IPv6 whose Next Header is this — see the note below |
+| `MatchICMPv4Echo()` / `MatchICMPv6Echo()` | echo request (ping / ping6) |
 | `MatchSrcIP(cidr)` | source IP in this CIDR, IPv4 or IPv6 (e.g. `10.0.0.0/8`, `2001:db8::/32`) |
 | `MatchDstIP(cidr)` | destination IP in this CIDR, IPv4 or IPv6 |
 | `MatchFlow(src, dst)` | src CIDR **and** dst CIDR together, i.e. one direction of a flow |
@@ -316,13 +344,17 @@ Match builders:
 | `MatchAll()` | every packet, the deliberate "take everything" |
 | `MatchNone()` | nothing, attach without redirecting (e.g. zero copy TX for a sender) |
 
-That is every builder. The options that install them, and the one exception to
-them, are:
+That is every built-in builder. For anything they miss,
+[`bpfmatch`](#filtering-with-tcpdump-expressions) matches whatever a tcpdump
+filter matches, and [`NewMatch`](#custom-matches) takes raw eBPF.
+
+The options that install them, and the two that hold traffic back, are:
 
 | Option | Effect |
 |--------|--------|
 | `WithFilter(matches...)` | redirect packets matching **any** of these builders |
 | `WithUDPPorts(ports...)` | shorthand for `WithFilter(MatchUDPPort(ports...))` |
+| `WithExcept(matches...)` | pass packets matching any of these to the kernel, whatever the filter says |
 | `WithKeepManagement(extraTCPPorts...)` | the inverse: keep ARP, IPv6 ND, SSH and DNS replies *out* of the capture so a broad filter cannot lock you out of the box ([below](#keeping-your-session-alive-withkeepmanagement)) |
 
 Each match is compiled to eBPF instructions with
@@ -331,15 +363,223 @@ a single XDP program, loaded and checked by the kernel verifier (the test suite
 loads every builder and a composite to prove they verify).
 
 A few things to know. Matches combine with OR, a packet is redirected if it
-matches any of them. The one built-in AND is `MatchFlow`, which requires a src
-CIDR and a dst CIDR together; arbitrary AND across the other builders is not
-expressible as a single filter. The port, proto, and ICMP matchers
-are IPv4 only and assume no IP options, the common case; the IP
-(CIDR) matchers handle both IPv4 and IPv6 and read fixed offsets, so they are not
-bothered by IP options or IPv6 extension headers. Every matcher transparently
-skips a single 802.1Q VLAN tag, so the same filter works whether or not the NIC
-strips the tag before XDP — stacked QinQ tags are not unwound. For classification
-beyond these builders, redirect everything and classify in your receive loop.
+matches any of them. The one built-in AND is `MatchFlow`; for arbitrary AND, and
+for anything else these builders miss, use
+[`bpfmatch`](#filtering-with-tcpdump-expressions).
+
+The port matchers handle IPv4 **and** IPv6. The protocol and echo matchers are
+named for the family they match, because the two are not equivalent: IPv6's Next
+Header names whatever comes next, which may be an extension header rather than
+the upper-layer protocol, and ICMP and ICMPv6 are different protocols with
+different numbers.
+
+All of the port, protocol and echo matchers assume no IP options and no IPv6
+extension headers, so a packet carrying either does not match. The
+[cBPF layer](#filtering-with-tcpdump-expressions) is what handles those, because
+pcap-compiled filters compute the header length instead of assuming it. The IP
+(CIDR) matchers read fixed offsets and are unaffected by both.
+
+Every matcher transparently skips a single 802.1Q VLAN tag, so the same filter
+works whether or not the NIC strips the tag before XDP — stacked QinQ tags are
+not unwound.
+
+### Filtering with tcpdump expressions
+
+`bpfmatch.Match` matches packets accepted by a **classic BPF** program — the
+instruction set `tcpdump` and libpcap compile their filter expressions to. It is
+compiled to eBPF with [`cbpfc`](https://github.com/cloudflare/cbpfc) and spliced
+into the filter alongside every other match, so a tcpdump filter expression
+becomes an in-kernel filter:
+
+```
+tcpdump -ddd 'tcp port 22 and not src host 192.0.2.1'
+```
+
+The usual way in is the expression itself, via the optional `pcapfilter`
+module:
+
+```
+go get github.com/atoonk/go-afxdp/pcapfilter
+```
+
+```go
+fleet, err := afxdp.Open("eth0", afxdp.WithFilter(
+    pcapfilter.Match("tcp port 443 and not src net 192.0.2.0/24"),
+), afxdp.WithKeepManagement())
+```
+
+A runnable version is in
+[`pcapfilter/example`](pcapfilter/example). If you already have cBPF
+instructions — from `tcpdump -ddd`, `pcap_compile`, or anywhere else — skip
+libpcap and use the pure-Go `bpfmatch` module directly:
+
+```
+go get github.com/atoonk/go-afxdp/bpfmatch
+```
+
+```go
+fleet, err := afxdp.Open("eth0", afxdp.WithFilter(
+    bpfmatch.Match("ssh, not from .1", insns),
+))
+```
+
+This is the layer to reach for before writing eBPF by hand. Any normal
+packet-data expression — anything you would type after `tcpdump` — works:
+
+| Expression | Captures |
+|---|---|
+| `tcp port 22 and not src host 192.0.2.1` | SSH, except from one host — `and`/`not`, which `WithFilter` alone cannot express |
+| `udp portrange 5000-6000` | a port range, without unrolling a thousand compares |
+| `tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0` | connection openers only |
+| `vlan 100 and tcp port 443` | one VLAN, and inside it one port |
+| `ip6 and tcp port 443` | a single address family — like the built-ins, this reads Next Header and does not walk extension headers; `protochain 6` does |
+| `proto gre` / `ip proto 47` | GRE, either spelling |
+| `icmp or icmp6` | all ICMP and ICMPv6 traffic — errors, ND and echo alike |
+| `ether dst 01:00:5e:00:00:01` | one destination MAC, multicast included |
+| `ip[6:2] & 0x1fff != 0` | IPv4 fragments — an arbitrary byte offset with a mask |
+| `udp port 4789 and udp[12:4] & 0xffffff00 = 0x0004d200` | one VXLAN VNI — 1234 is `0x0004d2`, in the top three of the four loaded bytes |
+| `greater 1000` | frames over 1000 bytes |
+
+Unlike the named builders it also handles **IPv4 headers carrying options**,
+because pcap-compiled filters compute the header length rather than assuming
+it.
+
+One caveat for cBPF from *other* sources: the program must stick to packet
+data. Filters compiled against a live capture handle can contain Linux
+ancillary loads (`SKF_AD_*`, e.g. for the kernel-stripped VLAN tag) that read
+socket-buffer metadata XDP does not have; `bpfmatch` rejects those with an
+error rather than mismatching, but the message names a negative offset you
+never wrote. `pcapfilter`, `tcpdump -ddd`, and anything else that compiles
+against a dead handle never produces them.
+
+Semantics are exactly those of the cBPF program you supply, evaluated against
+the frame as XDP received it. Note XDP is ingress-only, so a filter written
+expecting both directions of a conversation only sees the inbound half.
+
+Both are **separate modules**, so the core `go-afxdp` module stays pure Go: no
+cgo, no libpcap, no `tcpdump` binary, and none of the newer Go or `cilium/ebpf`
+versions the cBPF compiler needs. You take those on only by importing the layer
+that uses them.
+
+### Custom matches
+
+If neither the named builders nor the cBPF layer cover what you need, `NewMatch`
+lets you emit your own eBPF classification block. Most people should not need
+it — reach for `bpfmatch`/`pcapfilter` first. A custom block gets the same
+treatment as the built-in ones: assembled into the filter program, checked by
+the verifier, and reported by `Fleet.Info`.
+
+The builder receives a `MatchEnv` and returns instructions that jump to
+`env.Redirect` on a match and `env.Next` otherwise. This one reimplements
+`MatchUDPPort(5000)`:
+
+```go
+udp5000 := afxdp.NewMatch("udp/5000", func(e afxdp.MatchEnv) (asm.Instructions, error) {
+    ins, frame := e.FrameBase()
+    // Ethernet 14 + IPv4 20 (no options) puts the UDP dest port at 36.
+    ins = append(ins, e.Bounds(frame, 36+2)...)
+    return append(ins,
+        asm.LoadMem(asm.R3, frame, afxdp.OffEtherType, asm.Half),
+        asm.JNE.Imm(asm.R3, afxdp.NetShort(afxdp.EtherTypeIPv4), e.Next),
+        asm.LoadMem(asm.R3, frame, 23, asm.Byte), // IP protocol
+        asm.JNE.Imm(asm.R3, 17, e.Next),          // UDP
+        asm.LoadMem(asm.R3, frame, 36, asm.Half), // UDP dest port
+        asm.JEq.Imm(asm.R3, afxdp.NetShort(5000), e.Redirect),
+    ), nil
+})
+
+fleet, err := afxdp.Open("eth0", afxdp.WithFilter(udp5000))
+```
+
+`e.FrameBase()` returns the instructions that establish a frame base with a
+single VLAN tag skipped, plus the register holding it — so a custom match
+inherits the same tag handling as the built-ins. `e.Bounds(base, n)` emits the
+bounds check the verifier requires before any packet read; skip it and the
+program is rejected. Falling off the end of the block means "no match", so you
+only need `e.Next` for early exits. `e.Label(name)` gives you a symbol unique to
+your block if you need your own control flow. A builder that cannot fail
+returns a nil error; the error exists for builders that compile something, as
+`bpfmatch` does.
+
+Registers, which matter because the block is spliced into a larger program:
+
+| Register | Role | Your block may |
+|---|---|---|
+| `R6` (`e.DataEnd`) | `data_end` | read |
+| `R7` (`e.Data`) | frame start | read |
+| **`R8`** | **`rx_queue_index`** | **nothing — reserved** |
+| `R9` | the `FrameBase()` register | use once `FrameBase()` has been called |
+| `R0`–`R5` | scratch | use *between* helper calls |
+
+`R8` is the one that used to be dangerous: the redirect tail reads it to pick
+the destination socket, so a block that overwrote it verified cleanly, attached,
+and then delivered packets to the wrong queue with no error anywhere. `NewMatch`
+now rejects any block that mentions `R8` at all, so that mistake is an error from
+`Open` instead.
+
+`Bounds` and `FrameBase` use scratch registers internally, and which ones is not
+part of the contract — don't assume a value in `R0`–`R5` survives a call to one.
+
+Two failure modes worth knowing: a filter in which *no* match can ever reach
+`Redirect` leaves the redirect path unreachable, which the verifier rejects; and
+under `WithMultiBuffer` a read past the first fragment still loads but silently
+stops matching, so keep reads inside the L2/L3/L4 headers.
+
+Verifier rejections come back from `Open` as an `*ebpf.VerifierError`. Printing
+it with `%v` gives only its first line (`unreachable insn 6`); the program
+listing that shows which instruction was rejected needs the concrete type:
+
+```go
+fleet, err := afxdp.Open("eth0", afxdp.WithFilter(myMatch))
+if err != nil {
+    var ve *ebpf.VerifierError
+    if errors.As(err, &ve) {
+        log.Fatalf("filter rejected:\n%+v", ve) // %+v, and only on ve
+    }
+    log.Fatal(err)
+}
+```
+
+### Testing a custom match
+
+`MatchPacket` runs a filter against a packet you supply and reports whether it
+would be redirected. It assembles and executes the same eBPF `Open` would
+attach — it does not reimplement matching in Go — so a wrong offset, a missed
+byte swap or a mishandled VLAN tag shows up exactly as it would on a live NIC:
+
+```go
+ok, err := afxdp.MatchPacket(frame, afxdp.WithFilter(udp5000))
+```
+
+It takes the same options `Open` does, so it can model the filter you actually
+deploy — exceptions included:
+
+```go
+ok, err := afxdp.MatchPacket(frame,
+    afxdp.WithFilter(udp5000),
+    afxdp.WithExcept(afxdp.MatchSrcIP("192.0.2.10/32")),
+)
+```
+
+That makes a custom match unit-testable with no NIC and no traffic. Test the
+near misses too — a byte-order slip usually still matches *something*, so a
+matcher only ever shown packets it should accept looks correct until it ships.
+It needs the same privileges as `Open` (`CAP_BPF` and `CAP_NET_ADMIN`, or root).
+Do not blanket-skip on error, though: the kernel reports a verifier rejection as
+`EACCES`, so a broken matcher and a missing capability look identical. Unwrap to
+`*ebpf.VerifierError` and fail on that; skip on anything else.
+
+Worked examples live in [`examples/customfilter/`](examples/customfilter).
+Start with [`udpsrcport`](examples/customfilter/udpsrcport), which is the
+shortest and exists purely as a tutorial — for real source-port matching use the
+built-in `MatchUDPSrcPort`. The other four each capture something no built-in
+expresses: a [VLAN ID](examples/customfilter/vlan), a
+[destination MAC](examples/customfilter/dstmac),
+[TCP SYNs](examples/customfilter/tcpsyn), and a
+[VXLAN VNI](examples/customfilter/vxlan).
+
+For the tcpdump-expression path — the one most people should reach for — see
+[`pcapfilter/example`](pcapfilter/example).
 
 ### Keeping your session alive: `WithKeepManagement`
 
@@ -643,6 +883,9 @@ but the old figure no longer describes it.
 | [`examples/multiqueue`](examples/multiqueue) | `Open` across all queues, `Info` plus aggregate `Stats` |
 | [`examples/udpreflector`](examples/udpreflector) | `Open` plus a UDP-port filter, wire-speed UDP echo with `Info`/`Stats` |
 | [`examples/dns`](examples/dns) | a real scenario, a UDP/53 forwarding DNS resolver: AF_XDP client path, `miekg/dns` upstream to 8.8.8.8, async worker pool |
+| [`pcapfilter/example`](pcapfilter/example) | **filtering by tcpdump expression** — `-filter "tcp port 443 and not src net 192.0.2.0/24"` |
+| [`examples/customfilter/gre`](examples/customfilter/gre) | **the low-level story end to end**: a custom `Match` written with the exported API, `MatchError` validation, and a unit test that runs it against crafted packets with no NIC |
+| [`examples/customfilter/`](examples/customfilter) | four more custom matchers: a VLAN ID, a destination MAC, TCP SYNs, a VXLAN VNI, plus `udpsrcport` as the tutorial |
 
 ```
 go build -o drop ./examples/drop

@@ -148,7 +148,7 @@ import (
 
 func main() {
 	fleet, err := xdp.Open("ens5",
-		xdp.WithFilter(xdp.MatchICMPEcho()),
+		xdp.WithFilter(xdp.MatchICMPv4Echo()),
 		xdp.WithMultiBuffer(),
 	)
 	if err != nil {
