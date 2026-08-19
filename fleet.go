@@ -149,6 +149,10 @@ func Open(iface string, opts ...Option) (*Fleet, error) {
 		// addressed to the interface, so only ARP/ND are worth passing.
 		exceptions = managementExceptions(locals, cfg.mgmtTCPPorts, !known)
 	}
+	// User exceptions (WithExcept) go last: they and the management set feed
+	// the same list, and order among exceptions does not matter because any
+	// hit passes the packet to the kernel.
+	exceptions = append(exceptions, cfg.except...)
 
 	filter := filterDesc(cfg.matches, exceptions)
 

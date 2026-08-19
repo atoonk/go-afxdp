@@ -36,7 +36,7 @@ func main() {
 	// echo (ping), so we don't steal anything else from the kernel. A filter is
 	// required; without one Open would redirect every packet and could cut off
 	// your own connectivity.
-	fleet, err := afxdp.Open(*iface, afxdp.WithFilter(afxdp.MatchICMPEcho()))
+	fleet, err := afxdp.Open(*iface, afxdp.WithFilter(afxdp.MatchICMPv4Echo()))
 	if err != nil {
 		log.Fatalf("open %s: %v", *iface, err)
 	}

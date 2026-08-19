@@ -47,12 +47,12 @@ func TestFilterProgramsVerify(t *testing.T) {
 			netip.MustParsePrefix("2001:db8::1/128"),
 			netip.MustParsePrefix("fd00::2/128"),
 		}, []uint16{22}, false)},
-		{"keep-management-with-filter", []Match{MatchUDPPort(4789), MatchICMPEcho()}, mgmt()},
+		{"keep-management-with-filter", []Match{MatchUDPPort(4789), MatchICMPv4Echo()}, mgmt()},
 		{"udp-two-ports", []Match{MatchUDPPort(4789, 51820)}, nil},
 		{"udp-any", []Match{MatchUDPPort()}, nil},
 		{"tcp-port", []Match{MatchTCPPort(443)}, nil},
-		{"icmp-echo", []Match{MatchICMPEcho()}, nil},
-		{"ip-proto-gre", []Match{MatchIPProto(47)}, nil},
+		{"icmp-echo", []Match{MatchICMPv4Echo()}, nil},
+		{"ip-proto-gre", []Match{MatchIPv4Proto(47)}, nil},
 		{"ethertype-arp", []Match{MatchEtherType(0x0806)}, nil},
 		{"all", []Match{MatchAll()}, nil},
 		{"none", []Match{MatchNone()}, nil},
@@ -64,13 +64,19 @@ func TestFilterProgramsVerify(t *testing.T) {
 		{"flow-v4", []Match{MatchFlow("10.0.0.1/32", "10.0.0.2/32")}, nil},
 		{"flow-v6", []Match{MatchFlow("2001:db8::/32", "2001:db8:1::/48")}, nil},
 		{"flow-both-dirs", []Match{MatchFlow("10.0.0.1/32", "10.0.0.2/32"), MatchFlow("10.0.0.2/32", "10.0.0.1/32")}, nil},
-		{"composite", []Match{MatchUDPPort(4789, 51820), MatchICMPEcho(), MatchTCPPort(22), MatchSrcIP("172.16.0.0/12")}, nil},
+		{"composite", []Match{MatchUDPPort(4789, 51820), MatchICMPv4Echo(), MatchTCPPort(22), MatchSrcIP("172.16.0.0/12")}, nil},
 	}
 	// Every filter is loaded twice: once plain and once with
-	// BPF_F_XDP_HAS_FRAGS. Under xdp.frags semantics data_end covers only the
-	// linear head, so a filter that reached past it would verify plain and be
-	// rejected here. Our matches only parse L2/L3/L4 headers, which always live
-	// in the first fragment — this test is what keeps that true.
+	// BPF_F_XDP_HAS_FRAGS, so both the ordinary and the WithMultiBuffer load
+	// paths stay verifiable.
+	//
+	// The flag does not change what the verifier accepts — a bounds-checked
+	// read loads either way, an unchecked one is rejected either way. It
+	// changes runtime: under xdp.frags data_end covers only the first
+	// fragment, so a read past the linear head silently stops matching instead
+	// of failing to load. Our matches only parse L2/L3/L4 headers, which
+	// always live in the first fragment, so they are unaffected — but that
+	// property is upheld by review, not by this test.
 	for _, frags := range []bool{false, true} {
 		suffix := ""
 		if frags {

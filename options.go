@@ -158,6 +158,7 @@ type config struct {
 	opts    Options
 	queues  int     // 0 means "all rx queues"
 	matches []Match // packet filter; empty means "redirect all packets"
+	except  []Match // user-supplied exceptions (WithExcept); passed, never redirected
 	mode    xdpMode // how to attach/bind; default modeAuto picks the best
 
 	keepManagement bool     // pass management traffic to the kernel (see WithKeepManagement)
@@ -215,7 +216,7 @@ func WithQueues(n int) Option { return func(c *config) { c.queues = n } }
 //
 //	afxdp.Open("eth0", afxdp.WithFilter(
 //		afxdp.MatchUDPPort(4789, 51820),
-//		afxdp.MatchICMPEcho(),
+//		afxdp.MatchICMPv4Echo(),
 //	))
 //
 // See Match for the available builders and their limitations.
@@ -224,7 +225,7 @@ func WithFilter(matches ...Match) Option {
 }
 
 // WithUDPPorts is shorthand for WithFilter(MatchUDPPort(ports...)): redirect
-// only IPv4/UDP packets to these destination ports, pass the rest to the
+// only UDP packets to these destination ports, IPv4 and IPv6, pass the rest to the
 // kernel. For mixing protocols (e.g. UDP ports plus ICMP) use WithFilter.
 func WithUDPPorts(ports ...uint16) Option {
 	return func(c *config) { c.matches = append(c.matches, MatchUDPPort(ports...)) }
@@ -348,6 +349,23 @@ func WithMultiBuffer() Option {
 		c.multiBuffer = true
 		c.opts.BindFlags |= unix.XDP_USE_SG
 	}
+}
+
+// WithExcept passes packets matching any of these to the kernel instead of
+// redirecting them, whatever the filter says. Exceptions are evaluated first
+// and win, so this is how you express "capture X, but never Y":
+//
+//	afxdp.Open("eth0",
+//		afxdp.WithFilter(afxdp.MatchUDPPort(4789)),
+//		afxdp.WithExcept(afxdp.MatchSrcIP("192.0.2.10/32")), // ...but not from this host
+//	)
+//
+// A single cBPF filter can also say "A and not B" (see the bpfmatch module), which is
+// usually clearer for one expression. WithExcept is for excluding across
+// several matches at once, and composes with WithKeepManagement — both feed
+// the same exception list.
+func WithExcept(matches ...Match) Option {
+	return func(c *config) { c.except = append(c.except, matches...) }
 }
 
 // WithKeepManagement keeps the traffic that keeps you logged in out of the
