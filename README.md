@@ -418,9 +418,14 @@ go get github.com/atoonk/go-afxdp/bpfmatch
 ```
 
 ```go
-fleet, err := afxdp.Open("eth0", afxdp.WithFilter(
-    bpfmatch.Match("ssh, not from .1", insns),
-))
++// insns is []bpf.Instruction, e.g. the output of
++//   tcpdump -ddd 'tcp port 22 and not src host 192.0.2.1'
++//
++// The first argument is only a label: it names the rule in Fleet.Info and in
++// error messages, and has no effect on what matches.
+ fleet, err := afxdp.Open("eth0", afxdp.WithFilter(
++    bpfmatch.Match("tcp/22 except 192.0.2.1", insns),
+ ))
 ```
 
 This is the layer to reach for before writing eBPF by hand. Any normal
